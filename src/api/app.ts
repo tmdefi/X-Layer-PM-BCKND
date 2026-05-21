@@ -1,4 +1,5 @@
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
 import { ZodError } from "zod";
 import { env } from "../config/env.js";
@@ -30,11 +31,21 @@ export async function buildApp() {
     origin: true
   });
 
+  await app.register(rateLimit, {
+    global: false
+  });
+
   app.setErrorHandler((error, _request, reply) => {
     if (error instanceof ZodError) {
       return reply.code(400).send({
         error: "Invalid request",
         issues: error.issues
+      });
+    }
+
+    if (isClientStatusError(error)) {
+      return reply.code(error.statusCode).send({
+        error: error.message
       });
     }
 
@@ -64,4 +75,10 @@ export async function buildApp() {
   });
 
   return app;
+}
+
+function isClientStatusError(error: unknown): error is Error & { statusCode: number } {
+  if (!(error instanceof Error)) return false;
+  const statusCode = (error as Error & { statusCode?: unknown }).statusCode;
+  return typeof statusCode === "number" && statusCode >= 400 && statusCode < 500;
 }

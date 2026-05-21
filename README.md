@@ -123,3 +123,45 @@ SYNC_ON_CHAIN_MARKET_LIMIT=50
 ```
 
 `SYNC_ON_CHAIN_MARKET_LIMIT` caps contract writes per sync run. Markets that remain open without a `conditionId` are picked up by later runs.
+
+## CLOB Trading API
+
+Trading uses off-chain signed EIP-712 orders and operator-submitted matches on `CTFExchange`.
+
+1. `POST /clob/orders/prepare` resolves `marketId + outcomeSide` to the on-chain token id and returns an unsigned order plus typed data for the maker wallet.
+2. The wallet signs the typed data and the client submits the signed order to `POST /clob/orders`.
+3. The backend stores open orders and serves `GET /markets/:id/orderbook` and `GET /markets/:id/trades`.
+4. The matcher checks accepted signed orders for crossing BUY/SELL liquidity on the same outcome and submits matches through the operator wallet.
+5. Manual operator matching remains available through `POST /clob/matches`; trades, fills, and order remaining sizes are persisted.
+
+Maker-wallet maintenance routes:
+
+- `GET /clob/nonces/:maker` reads the exchange nonce.
+- `POST /clob/nonces/increment-transaction` returns the wallet transaction that invalidates all orders at the current nonce.
+- `POST /clob/orders/:id/cancel-transaction` returns the wallet transaction for a single order cancellation.
+- `POST /clob/orders/:id/sync-status` refreshes backend order visibility after a cancellation or nonce change reaches the chain.
+
+The exchange EIP-712 domain name remains the deployed contract domain used by `CTFExchange`; clients should sign the typed-data payload returned by the backend rather than hard-coding a renamed domain.
+
+Automatic matching is enabled by default:
+
+```env
+CLOB_AUTO_MATCH_ENABLED=true
+CLOB_AUTO_MATCH_MAX_MAKERS=10
+```
+
+The first matcher pass covers complementary `BUY` vs `SELL` orders for the same market outcome. It uses best maker price first and then earlier accepted order time. The exchange mint/merge path for matching complementary outcome buys or sells is still a later extension.
+
+### Trading API Security
+
+`POST /clob/matches` and `POST /clob/matcher/tick` are operator routes because they submit transactions through the backend operator wallet. Set a long random `CLOB_OPERATOR_API_KEY` and send it in the `x-operator-api-key` header for those routes.
+
+Order entry is rate-limited per client IP on both `POST /clob/orders/prepare` and `POST /clob/orders`:
+
+```env
+CLOB_OPERATOR_API_KEY=
+CLOB_ORDER_RATE_LIMIT_MAX=60
+CLOB_ORDER_RATE_LIMIT_WINDOW=1 minute
+```
+
+Accepted order preparation and signed order submission events are written to Fastify logs with market, order, side, maker, and client IP fields. Signatures and API keys are not logged.

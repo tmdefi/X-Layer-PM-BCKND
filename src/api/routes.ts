@@ -1,6 +1,19 @@
 import type { FastifyInstance } from "fastify";
-import type { Hex } from "viem";
-import { createMarketOnChain, hashIdentifier, outcomeSideToResolverOutcome, resolveMarketOnChain } from "../chain/index.js";
+import { randomUUID } from "node:crypto";
+import type { Address, Hex } from "viem";
+import {
+  cancellationTransaction,
+  createMarketOnChain,
+  getExchangeNonce,
+  getExchangeOrderStatus,
+  getMarketOnChain,
+  hashIdentifier,
+  incrementNonceTransaction,
+  outcomeSideToResolverOutcome,
+  prepareExchangeOrder,
+  resolveMarketOnChain,
+  validateExchangeOrder
+} from "../chain/index.js";
 import { env } from "../config/env.js";
 import {
   MAIN_CARD_PLAYER_MARKET_TEMPLATES,
@@ -24,6 +37,17 @@ import type { FixtureInsights, FixtureQuery, SourceRegistry } from "../sources/i
 import type { SettlementWorker } from "../settlement/index.js";
 import type { ProviderSyncWorker } from "../sync/index.js";
 import type { InMemoryStore } from "./store.js";
+import { requireClobOperatorApiKey } from "./security.js";
+import {
+  autoMatchOrder,
+  buildOrderbook,
+  executeMatchPlan,
+  manualMatchPlan,
+  matchRequestError,
+  orderPrice,
+  tickAutoMatcher
+} from "../trading/index.js";
+import type { ExchangeOrder, StoredClobOrder } from "../trading/index.js";
 import {
   autoMainCardPlayerMarketsSchema,
   createMarketOnChainSchema,
@@ -33,9 +57,13 @@ import {
   createYesNoMarketSchema,
   fixtureSchema,
   generateFixtureMarketsSchema,
+  matchClobOrdersSchema,
+  prepareClobOrderSchema,
   providerFixtureResultSchema,
   sourceFixtureQuerySchema,
-  submitMarketResolutionOnChainSchema
+  submitClobOrderSchema,
+  submitMarketResolutionOnChainSchema,
+  tickClobMatcherSchema
 } from "./schemas.js";
 
 export async function registerRoutes(
@@ -511,6 +539,253 @@ export async function registerRoutes(
   app.get("/resolutions", async () => ({
     resolutions: store.listResolutions()
   }));
+
+  app.post("/clob/orders/prepare", {
+    config: {
+      rateLimit: {
+        max: env.CLOB_ORDER_RATE_LIMIT_MAX,
+        timeWindow: env.CLOB_ORDER_RATE_LIMIT_WINDOW
+      }
+    }
+  }, async (request, reply) => {
+    const input = prepareClobOrderSchema.parse(request.body);
+    const market = store.getMarket(input.marketId);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+    if (market.status !== "open") return reply.code(400).send({ error: "Only open markets accept orders" });
+
+    const prepared = await prepareExchangeOrder({
+      ...input,
+      maker: input.maker as Address,
+      signer: input.signer as Address | undefined,
+      taker: input.taker as Address | undefined
+    });
+
+    request.log.info({
+      marketId: market.id,
+      maker: input.maker,
+      outcomeSide: input.outcomeSide,
+      side: input.side,
+      ip: request.ip
+    }, "Prepared CLOB order signing payload");
+
+    return reply.code(201).send({
+      market,
+      order: prepared.order,
+      typedData: prepared.typedData
+    });
+  });
+
+  app.post("/clob/orders", {
+    config: {
+      rateLimit: {
+        max: env.CLOB_ORDER_RATE_LIMIT_MAX,
+        timeWindow: env.CLOB_ORDER_RATE_LIMIT_WINDOW
+      }
+    }
+  }, async (request, reply) => {
+    const input = submitClobOrderSchema.parse(request.body);
+    const market = store.getMarket(input.marketId);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+    if (market.status !== "open") return reply.code(400).send({ error: "Only open markets accept orders" });
+
+    const storedMarket = await getMarketOnChain(input.marketId);
+    if (!storedMarket) return reply.code(400).send({ error: "Market has not been created on-chain" });
+
+    const expectedTokenId =
+      input.outcomeSide === "NO" || input.outcomeSide === "UNDER" ? storedMarket.token0 : storedMarket.token1;
+    if (input.order.tokenId !== expectedTokenId) {
+      return reply.code(400).send({ error: "Order tokenId does not match the requested market outcome" });
+    }
+
+    const orderHash = await validateExchangeOrder(input.order as ExchangeOrder);
+    const existing = store.getClobOrderByHash(orderHash);
+    if (existing) {
+      request.log.info({
+        marketId: market.id,
+        orderId: existing.id,
+        orderHash,
+        maker: existing.order.maker,
+        duplicate: true,
+        ip: request.ip
+      }, "Accepted duplicate CLOB order submission");
+      return reply.code(200).send({ order: existing });
+    }
+
+    const now = new Date().toISOString();
+    const order: StoredClobOrder = {
+      id: randomUUID(),
+      orderHash,
+      marketId: market.id,
+      outcomeSide: input.outcomeSide,
+      order: input.order as ExchangeOrder,
+      side: input.order.side === 0 ? "BUY" : "SELL",
+      remainingMaker: input.order.makerAmount,
+      status: "open",
+      createdAt: now,
+      updatedAt: now
+    };
+
+    const stored = store.upsertClobOrder(order);
+    request.log.info({
+      marketId: market.id,
+      orderId: stored.id,
+      orderHash: stored.orderHash,
+      maker: stored.order.maker,
+      outcomeSide: stored.outcomeSide,
+      side: stored.side,
+      ip: request.ip
+    }, "Accepted signed CLOB order");
+
+    let autoMatch;
+    try {
+      autoMatch = await autoMatchOrder(store, stored);
+      if (autoMatch.matched) {
+        request.log.info({
+          marketId: market.id,
+          orderId: stored.id,
+          tradeId: autoMatch.result?.trade.id,
+          transactionHash: autoMatch.result?.trade.transactionHash
+        }, "Automatically matched CLOB order");
+      }
+    } catch (error) {
+      request.log.warn({
+        marketId: market.id,
+        orderId: stored.id,
+        error: error instanceof Error ? error.message : "Unknown matcher error"
+      }, "Automatic CLOB matching failed after order acceptance");
+      autoMatch = {
+        attempted: true,
+        matched: false,
+        reason: error instanceof Error ? error.message : "Automatic matching failed"
+      };
+    }
+
+    return reply.code(201).send({
+      order: store.getClobOrder(stored.id) ?? stored,
+      autoMatch
+    });
+  });
+
+  app.get<{ Querystring: { marketId?: string; maker?: string; status?: string } }>("/clob/orders", async (request) => {
+    const orders = store.listClobOrders(request.query.marketId).filter((order) => {
+      if (request.query.maker && order.order.maker.toLowerCase() !== request.query.maker.toLowerCase()) return false;
+      if (request.query.status && order.status !== request.query.status) return false;
+      return true;
+    });
+    return { orders };
+  });
+
+  app.get<{ Params: { id: string } }>("/clob/orders/:id", async (request, reply) => {
+    const order = store.getClobOrder(request.params.id);
+    if (!order) return reply.code(404).send({ error: "Order not found" });
+    return { order, fills: store.listClobFills(order.id) };
+  });
+
+  app.get<{ Params: { maker: string } }>("/clob/nonces/:maker", async (request) => ({
+    maker: request.params.maker,
+    nonce: await getExchangeNonce(request.params.maker as Address)
+  }));
+
+  app.post("/clob/nonces/increment-transaction", async () => ({
+    transaction: incrementNonceTransaction()
+  }));
+
+  app.post<{ Params: { id: string } }>("/clob/orders/:id/cancel-transaction", async (request, reply) => {
+    const order = store.getClobOrder(request.params.id);
+    if (!order) return reply.code(404).send({ error: "Order not found" });
+    return {
+      order,
+      transaction: cancellationTransaction(order.order),
+      note: "The maker wallet must send this transaction; CTFExchange only allows the order maker to cancel."
+    };
+  });
+
+  app.post<{ Params: { id: string } }>("/clob/orders/:id/sync-status", async (request, reply) => {
+    const order = store.getClobOrder(request.params.id);
+    if (!order) return reply.code(404).send({ error: "Order not found" });
+
+    const [nonce, onChain] = await Promise.all([
+      getExchangeNonce(order.order.maker as Address),
+      getExchangeOrderStatus(order.orderHash)
+    ]);
+    const updated = refreshStoredOrderStatus(order, nonce, onChain);
+    store.upsertClobOrder(updated);
+
+    return { order: updated, nonce, onChain };
+  });
+
+  app.post("/clob/matches", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
+    const input = matchClobOrdersSchema.parse(request.body);
+    const takerOrder = store.getClobOrder(input.takerOrderId);
+    if (!takerOrder) return reply.code(404).send({ error: "Taker order not found" });
+
+    const makerOrders = input.makerOrderIds.map((id) => store.getClobOrder(id));
+    if (makerOrders.some((order) => !order)) {
+      return reply.code(404).send({ error: "Maker order not found" });
+    }
+    const definedMakerOrders = makerOrders as StoredClobOrder[];
+    const plan = manualMatchPlan({
+      takerOrder,
+      makerOrders: definedMakerOrders,
+      takerFillAmount: input.takerFillAmount,
+      makerFillAmounts: input.makerFillAmounts
+    });
+    const orderError = matchRequestError(plan);
+    if (orderError) return reply.code(400).send({ error: orderError });
+
+    return reply.code(201).send(await executeMatchPlan(store, plan));
+  });
+
+  app.post("/clob/matcher/tick", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
+    const input = tickClobMatcherSchema.parse(request.body ?? {});
+    const summaries = await tickAutoMatcher(store, input);
+    const matched = summaries.filter((summary) => summary.matched).length;
+
+    request.log.info({
+      marketId: input.marketId,
+      scanned: summaries.length,
+      matched
+    }, "Ran CLOB matcher tick");
+
+    return reply.code(201).send({
+      scanned: summaries.length,
+      matched,
+      summaries
+    });
+  });
+
+  app.get<{ Params: { id: string } }>("/markets/:id/orderbook", async (request, reply) => {
+    const market = store.getMarket(request.params.id);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+
+    const orders = store.listClobOrders(market.id);
+    const trades = store.listClobTrades(market.id);
+    const lastTrade = trades[0];
+    const lastTaker = lastTrade ? store.getClobOrder(lastTrade.takerOrderId) : undefined;
+
+    return {
+      market,
+      orderbook: buildOrderbook(orders),
+      priceData: {
+        lastTradePrice: lastTaker ? orderPrice(lastTaker) : undefined,
+        openOrderCount: orders.filter((order) => order.status === "open" || order.status === "partially_filled").length,
+        tradeCount: trades.length
+      }
+    };
+  });
+
+  app.get<{ Params: { id: string } }>("/markets/:id/trades", async (request, reply) => {
+    const market = store.getMarket(request.params.id);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+    return { trades: store.listClobTrades(market.id), fills: store.listClobFills().filter((fill) => {
+      const order = store.getClobOrder(fill.orderId);
+      return order?.marketId === market.id;
+    }) };
+  });
 }
 
 function hasFixtureMismatch(market: MarketDefinition, resultFixtureId: string): boolean {
@@ -631,4 +906,36 @@ function buildMarketCards(
       }))
     ];
   });
+}
+
+function refreshStoredOrderStatus(
+  order: StoredClobOrder,
+  currentNonce: string,
+  onChain: { isFilledOrCancelled: boolean; remaining: string }
+): StoredClobOrder {
+  if (order.status === "filled" || order.status === "cancelled") return order;
+
+  if (currentNonce !== order.order.nonce) {
+    return { ...order, status: "cancelled", updatedAt: new Date().toISOString() };
+  }
+
+  if (onChain.isFilledOrCancelled) {
+    return {
+      ...order,
+      remainingMaker: onChain.remaining,
+      status: onChain.remaining === "0" ? "cancelled" : "partially_filled",
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  if (onChain.remaining !== "0") {
+    return {
+      ...order,
+      remainingMaker: onChain.remaining,
+      status: onChain.remaining === order.order.makerAmount ? "open" : "partially_filled",
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  return order;
 }

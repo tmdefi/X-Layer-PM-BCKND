@@ -43,10 +43,90 @@ model Market {
 
   fixture    Fixture?    @relation(fields: [fixtureId], references: [id], onDelete: SetNull)
   resolution Resolution?
+  orders     ClobOrder[]
+  trades     ClobTrade[]
 
   @@index([fixtureId])
   @@index([status])
   @@index([type])
+}
+
+model ClobOrder {
+  id             String   @id
+  orderHash      String   @unique
+  marketId       String
+  outcomeSide    String
+  tokenId        String
+  side           String
+  maker          String
+  signer         String
+  taker          String
+  salt           String
+  makerAmount    String
+  takerAmount    String
+  remainingMaker String
+  expiration     String
+  nonce          String
+  feeRateBps     String
+  signatureType  Int
+  signature      String
+  status         String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  market     Market          @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  fills      ClobFill[]
+  takerTrades ClobTrade[]    @relation("TakerOrderTrades")
+  makerTrades ClobTradeMaker[]
+
+  @@index([marketId, status, outcomeSide, side])
+  @@index([maker, status])
+}
+
+model ClobFill {
+  id               String   @id
+  orderId          String
+  tradeId          String
+  makerAmountFilled String
+  takerAmountFilled String
+  transactionHash  String
+  createdAt        DateTime @default(now())
+
+  order ClobOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  trade ClobTrade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, createdAt])
+  @@index([tradeId])
+}
+
+model ClobTrade {
+  id                String   @id
+  marketId          String
+  takerOrderId      String
+  transactionHash   String
+  takerFillAmount   String
+  makerFillAmounts  Json
+  createdAt         DateTime @default(now())
+
+  market      Market           @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  takerOrder  ClobOrder        @relation("TakerOrderTrades", fields: [takerOrderId], references: [id], onDelete: Cascade)
+  makerOrders ClobTradeMaker[]
+  fills       ClobFill[]
+
+  @@index([marketId, createdAt])
+  @@index([transactionHash])
+}
+
+model ClobTradeMaker {
+  tradeId      String
+  makerOrderId String
+  fillAmount   String
+
+  trade      ClobTrade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  makerOrder ClobOrder @relation(fields: [makerOrderId], references: [id], onDelete: Cascade)
+
+  @@id([tradeId, makerOrderId])
+  @@index([makerOrderId])
 }
 
 model Resolution {

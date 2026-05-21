@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { env } from "../config/env.js";
 import type { Fixture, MarketDefinition, ResolutionDecision } from "../markets/types.js";
 import type { FixtureInsights } from "../sources/types.js";
+import type { StoredClobFill, StoredClobOrder, StoredClobTrade } from "../trading/types.js";
 
 export type FixtureInsightsCacheEntry = {
   insights: FixtureInsights;
@@ -31,6 +32,9 @@ export class InMemoryStore {
   readonly resolutions = new Map<string, ResolutionDecision>();
   readonly fixtureInsights = new Map<string, FixtureInsightsCacheEntry>();
   readonly providerSyncLogs = new Map<string, ProviderSyncLog>();
+  readonly clobOrders = new Map<string, StoredClobOrder>();
+  readonly clobFills = new Map<string, StoredClobFill>();
+  readonly clobTrades = new Map<string, StoredClobTrade>();
 
   upsertFixture(fixture: Fixture): Fixture {
     this.fixtures.set(fixture.id, fixture);
@@ -134,6 +138,45 @@ export class InMemoryStore {
       .slice(0, limit);
   }
 
+  upsertClobOrder(order: StoredClobOrder): StoredClobOrder {
+    const updated = { ...order, updatedAt: new Date().toISOString() };
+    this.clobOrders.set(updated.id, updated);
+    return updated;
+  }
+
+  getClobOrder(id: string): StoredClobOrder | undefined {
+    return this.clobOrders.get(id);
+  }
+
+  getClobOrderByHash(orderHash: string): StoredClobOrder | undefined {
+    return [...this.clobOrders.values()].find((order) => order.orderHash.toLowerCase() === orderHash.toLowerCase());
+  }
+
+  listClobOrders(marketId?: string): StoredClobOrder[] {
+    return [...this.clobOrders.values()]
+      .filter((order) => !marketId || order.marketId === marketId)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  }
+
+  recordClobTrade(trade: StoredClobTrade, fills: StoredClobFill[], orders: StoredClobOrder[]): StoredClobTrade {
+    this.clobTrades.set(trade.id, trade);
+    for (const fill of fills) this.clobFills.set(fill.id, fill);
+    for (const order of orders) this.clobOrders.set(order.id, order);
+    return trade;
+  }
+
+  listClobTrades(marketId?: string): StoredClobTrade[] {
+    return [...this.clobTrades.values()]
+      .filter((trade) => !marketId || trade.marketId === marketId)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  }
+
+  listClobFills(orderId?: string): StoredClobFill[] {
+    return [...this.clobFills.values()]
+      .filter((fill) => !orderId || fill.orderId === orderId)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  }
+
   async waitForPendingWrites(): Promise<void> {}
 }
 
@@ -145,12 +188,16 @@ export class PrismaBackedStore extends InMemoryStore {
   }
 
   async hydrate(): Promise<void> {
-    const [fixtures, markets, resolutions, fixtureInsights, providerSyncLogs] = await Promise.all([
+    const [fixtures, markets, resolutions, fixtureInsights, providerSyncLogs, clobOrders, clobFills, clobTrades] =
+      await Promise.all([
       this.prisma.fixture.findMany(),
       this.prisma.market.findMany(),
       this.prisma.resolution.findMany(),
       this.prisma.fixtureInsightsCache.findMany(),
-      this.prisma.providerSyncLog.findMany({ orderBy: { startedAt: "desc" }, take: 100 })
+      this.prisma.providerSyncLog.findMany({ orderBy: { startedAt: "desc" }, take: 100 }),
+      this.prisma.clobOrder.findMany(),
+      this.prisma.clobFill.findMany(),
+      this.prisma.clobTrade.findMany({ include: { makerOrders: true } })
     ]);
 
     for (const fixture of fixtures) {
@@ -216,6 +263,35 @@ export class PrismaBackedStore extends InMemoryStore {
         startedAt: log.startedAt.toISOString(),
         ...(log.finishedAt ? { finishedAt: log.finishedAt.toISOString() } : {}),
         ...(log.details !== null ? { details: log.details } : {})
+      });
+    }
+
+    for (const order of clobOrders) {
+      this.clobOrders.set(order.id, clobOrderFromPrisma(order));
+    }
+
+    for (const trade of clobTrades) {
+      this.clobTrades.set(trade.id, {
+        id: trade.id,
+        marketId: trade.marketId,
+        takerOrderId: trade.takerOrderId,
+        makerOrderIds: trade.makerOrders.map((maker) => maker.makerOrderId),
+        transactionHash: trade.transactionHash as StoredClobTrade["transactionHash"],
+        takerFillAmount: trade.takerFillAmount,
+        makerFillAmounts: trade.makerFillAmounts as string[],
+        createdAt: trade.createdAt.toISOString()
+      });
+    }
+
+    for (const fill of clobFills) {
+      this.clobFills.set(fill.id, {
+        id: fill.id,
+        orderId: fill.orderId,
+        tradeId: fill.tradeId,
+        makerAmountFilled: fill.makerAmountFilled,
+        takerAmountFilled: fill.takerAmountFilled,
+        transactionHash: fill.transactionHash as StoredClobFill["transactionHash"],
+        createdAt: fill.createdAt.toISOString()
       });
     }
   }
@@ -380,6 +456,61 @@ export class PrismaBackedStore extends InMemoryStore {
     return log;
   }
 
+  override upsertClobOrder(order: StoredClobOrder): StoredClobOrder {
+    const stored = super.upsertClobOrder(order);
+    this.persist(this.prisma.clobOrder.upsert({
+      where: { id: stored.id },
+      create: clobOrderToPrismaCreate(stored),
+      update: clobOrderToPrismaUpdate(stored)
+    }));
+    return stored;
+  }
+
+  override recordClobTrade(
+    trade: StoredClobTrade,
+    fills: StoredClobFill[],
+    orders: StoredClobOrder[]
+  ): StoredClobTrade {
+    const stored = super.recordClobTrade(trade, fills, orders);
+    this.persist(this.prisma.$transaction([
+      ...orders.map((order) =>
+        this.prisma.clobOrder.upsert({
+          where: { id: order.id },
+          create: clobOrderToPrismaCreate(order),
+          update: clobOrderToPrismaUpdate(order)
+        })
+      ),
+      this.prisma.clobTrade.create({
+        data: {
+          id: trade.id,
+          market: { connect: { id: trade.marketId } },
+          takerOrder: { connect: { id: trade.takerOrderId } },
+          transactionHash: trade.transactionHash,
+          takerFillAmount: trade.takerFillAmount,
+          makerFillAmounts: toJsonValue(trade.makerFillAmounts),
+          createdAt: new Date(trade.createdAt),
+          makerOrders: {
+            create: trade.makerOrderIds.map((makerOrderId, index) => ({
+              makerOrder: { connect: { id: makerOrderId } },
+              fillAmount: trade.makerFillAmounts[index] ?? "0"
+            }))
+          },
+          fills: {
+            create: fills.map((fill) => ({
+              id: fill.id,
+              order: { connect: { id: fill.orderId } },
+              makerAmountFilled: fill.makerAmountFilled,
+              takerAmountFilled: fill.takerAmountFilled,
+              transactionHash: fill.transactionHash,
+              createdAt: new Date(fill.createdAt)
+            }))
+          }
+        }
+      })
+    ]));
+    return stored;
+  }
+
   override async waitForPendingWrites(): Promise<void> {
     while (this.pendingWrites.size > 0) {
       await Promise.all([...this.pendingWrites]);
@@ -491,4 +622,103 @@ function marketShapeFields(market: MarketDefinition): { sport?: string; line?: s
 
 function toJsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function clobOrderFromPrisma(order: {
+  id: string;
+  orderHash: string;
+  marketId: string;
+  outcomeSide: string;
+  tokenId: string;
+  side: string;
+  maker: string;
+  signer: string;
+  taker: string;
+  salt: string;
+  makerAmount: string;
+  takerAmount: string;
+  remainingMaker: string;
+  expiration: string;
+  nonce: string;
+  feeRateBps: string;
+  signatureType: number;
+  signature: string;
+  status: string;
+  createdAt: Date;
+  updatedAt: Date;
+}): StoredClobOrder {
+  return {
+    id: order.id,
+    orderHash: order.orderHash as StoredClobOrder["orderHash"],
+    marketId: order.marketId,
+    outcomeSide: order.outcomeSide as StoredClobOrder["outcomeSide"],
+    side: order.side as StoredClobOrder["side"],
+    order: {
+      salt: order.salt,
+      maker: order.maker as StoredClobOrder["order"]["maker"],
+      signer: order.signer as StoredClobOrder["order"]["signer"],
+      taker: order.taker as StoredClobOrder["order"]["taker"],
+      tokenId: order.tokenId,
+      makerAmount: order.makerAmount,
+      takerAmount: order.takerAmount,
+      expiration: order.expiration,
+      nonce: order.nonce,
+      feeRateBps: order.feeRateBps,
+      side: order.side === "BUY" ? 0 : 1,
+      signatureType: order.signatureType as StoredClobOrder["order"]["signatureType"],
+      signature: order.signature as StoredClobOrder["order"]["signature"]
+    },
+    remainingMaker: order.remainingMaker,
+    status: order.status as StoredClobOrder["status"],
+    createdAt: order.createdAt.toISOString(),
+    updatedAt: order.updatedAt.toISOString()
+  };
+}
+
+function clobOrderToPrismaCreate(order: StoredClobOrder): Prisma.ClobOrderCreateInput {
+  return {
+    id: order.id,
+    orderHash: order.orderHash,
+    market: { connect: { id: order.marketId } },
+    outcomeSide: order.outcomeSide,
+    tokenId: order.order.tokenId,
+    side: order.side,
+    maker: order.order.maker,
+    signer: order.order.signer,
+    taker: order.order.taker,
+    salt: order.order.salt,
+    makerAmount: order.order.makerAmount,
+    takerAmount: order.order.takerAmount,
+    remainingMaker: order.remainingMaker,
+    expiration: order.order.expiration,
+    nonce: order.order.nonce,
+    feeRateBps: order.order.feeRateBps,
+    signatureType: order.order.signatureType,
+    signature: order.order.signature,
+    status: order.status,
+    createdAt: new Date(order.createdAt),
+    updatedAt: new Date(order.updatedAt)
+  };
+}
+
+function clobOrderToPrismaUpdate(order: StoredClobOrder): Prisma.ClobOrderUpdateInput {
+  return {
+    outcomeSide: order.outcomeSide,
+    tokenId: order.order.tokenId,
+    side: order.side,
+    maker: order.order.maker,
+    signer: order.order.signer,
+    taker: order.order.taker,
+    salt: order.order.salt,
+    makerAmount: order.order.makerAmount,
+    takerAmount: order.order.takerAmount,
+    remainingMaker: order.remainingMaker,
+    expiration: order.order.expiration,
+    nonce: order.order.nonce,
+    feeRateBps: order.order.feeRateBps,
+    signatureType: order.order.signatureType,
+    signature: order.order.signature,
+    status: order.status,
+    updatedAt: new Date(order.updatedAt)
+  };
 }

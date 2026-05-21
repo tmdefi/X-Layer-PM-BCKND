@@ -151,3 +151,61 @@ export const createMarketOnChainSchema = z.object({
 export const submitMarketResolutionOnChainSchema = z.object({
   questionId: bytes32Schema.optional()
 });
+
+export const addressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/, "Expected EVM address");
+export const hexSchema = z.string().regex(/^0x[0-9a-fA-F]*$/, "Expected hex string");
+const uintStringSchema = z.string().regex(/^(0|[1-9][0-9]*)$/, "Expected unsigned integer string");
+
+export const clobOrderSideSchema = z.enum(["BUY", "SELL"]);
+export const binaryOutcomeSideSchema = z.enum(["NO", "YES", "UNDER", "OVER"]);
+
+export const exchangeOrderSchema = z.object({
+  salt: uintStringSchema,
+  maker: addressSchema,
+  signer: addressSchema,
+  taker: addressSchema,
+  tokenId: uintStringSchema,
+  makerAmount: uintStringSchema.refine((value) => BigInt(value) > 0n, "makerAmount must be positive"),
+  takerAmount: uintStringSchema.refine((value) => BigInt(value) > 0n, "takerAmount must be positive"),
+  expiration: uintStringSchema,
+  nonce: uintStringSchema,
+  feeRateBps: uintStringSchema,
+  side: z.union([z.literal(0), z.literal(1)]),
+  signatureType: z.union([z.literal(0), z.literal(1)]),
+  signature: hexSchema
+});
+
+export const prepareClobOrderSchema = z.object({
+  marketId: z.string().min(1),
+  outcomeSide: binaryOutcomeSideSchema,
+  maker: addressSchema,
+  signer: addressSchema.optional(),
+  taker: addressSchema.optional(),
+  side: clobOrderSideSchema,
+  makerAmount: uintStringSchema.refine((value) => BigInt(value) > 0n, "makerAmount must be positive"),
+  takerAmount: uintStringSchema.refine((value) => BigInt(value) > 0n, "takerAmount must be positive"),
+  expiration: uintStringSchema.optional(),
+  feeRateBps: uintStringSchema.optional(),
+  signatureType: z.union([z.literal(0), z.literal(1)]).optional()
+});
+
+export const submitClobOrderSchema = z.object({
+  marketId: z.string().min(1),
+  outcomeSide: binaryOutcomeSideSchema,
+  order: exchangeOrderSchema
+});
+
+export const matchClobOrdersSchema = z.object({
+  takerOrderId: z.string().min(1),
+  makerOrderIds: z.array(z.string().min(1)).min(1),
+  takerFillAmount: uintStringSchema.refine((value) => BigInt(value) > 0n, "takerFillAmount must be positive"),
+  makerFillAmounts: z.array(uintStringSchema.refine((value) => BigInt(value) > 0n, "maker fill must be positive")).min(1)
+}).refine((input) => input.makerOrderIds.length === input.makerFillAmounts.length, {
+  message: "makerOrderIds and makerFillAmounts must have the same length",
+  path: ["makerFillAmounts"]
+});
+
+export const tickClobMatcherSchema = z.object({
+  marketId: z.string().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(25)
+});
