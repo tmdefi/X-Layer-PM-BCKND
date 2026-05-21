@@ -217,3 +217,9 @@ export const tickClobMatcherSchema = z.object({
   marketId: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(25)
 });
+
+export const portfolioQuerySchema = z.object({
+  marketIds: z.string().min(1).optional().transform((value) =>
+    value?.split(",").map((id) => id.trim()).filter(Boolean)
+  )
+});

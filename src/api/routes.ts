@@ -7,6 +7,7 @@ import {
   getExchangeNonce,
   getExchangeOrderStatus,
   getExchangeOrderReadiness,
+  getAccountPortfolioBalances,
   getMarketOnChain,
   hashIdentifier,
   incrementNonceTransaction,
@@ -46,11 +47,15 @@ import {
   manualMatchPlan,
   matchRequestError,
   orderPrice,
+  enrichPortfolioPosition,
+  portfolioActivity,
+  portfolioMarketCandidates,
   tickAutoMatcher
 } from "../trading/index.js";
 import type { ExchangeOrder, StoredClobOrder } from "../trading/index.js";
 import {
   autoMainCardPlayerMarketsSchema,
+  addressSchema,
   clobOrderReadinessSchema,
   createMarketOnChainSchema,
   createMainCardPlayerMarketsSchema,
@@ -61,6 +66,7 @@ import {
   generateFixtureMarketsSchema,
   matchClobOrdersSchema,
   prepareClobOrderSchema,
+  portfolioQuerySchema,
   providerFixtureResultSchema,
   sourceFixtureQuerySchema,
   submitClobOrderSchema,
@@ -72,12 +78,14 @@ export type ClobRouteChain = {
   getMarketOnChain: typeof getMarketOnChain;
   getExchangeOrderReadiness: typeof getExchangeOrderReadiness;
   validateExchangeOrder: typeof validateExchangeOrder;
+  getAccountPortfolioBalances: typeof getAccountPortfolioBalances;
 };
 
 const defaultClobRouteChain: ClobRouteChain = {
   getMarketOnChain,
   getExchangeOrderReadiness,
-  validateExchangeOrder
+  validateExchangeOrder,
+  getAccountPortfolioBalances
 };
 
 export async function registerRoutes(
@@ -841,6 +849,46 @@ export async function registerRoutes(
       return order?.marketId === market.id;
     }) };
   });
+
+  app.get<{ Params: { account: string }; Querystring: { marketIds?: string | undefined } }>(
+    "/portfolio/:account",
+    async (request) => {
+      const account = addressSchema.parse(request.params.account) as Address;
+      const query = portfolioQuerySchema.parse(request.query);
+      const activity = portfolioActivity(store, account);
+      const positions = await loadPortfolioPositions(store, clobChain, account, query.marketIds);
+
+      return {
+        account,
+        collateral: positions.collateral,
+        positions: positions.positions,
+        orders: activity.orders,
+        trades: activity.trades,
+        fills: activity.fills
+      };
+    }
+  );
+
+  app.get<{ Params: { account: string } }>("/portfolio/:account/orders", async (request) => {
+    const account = addressSchema.parse(request.params.account) as Address;
+    return { account, orders: portfolioActivity(store, account).orders };
+  });
+
+  app.get<{ Params: { account: string } }>("/portfolio/:account/trades", async (request) => {
+    const account = addressSchema.parse(request.params.account) as Address;
+    const activity = portfolioActivity(store, account);
+    return { account, trades: activity.trades, fills: activity.fills };
+  });
+
+  app.get<{ Params: { account: string }; Querystring: { marketIds?: string | undefined } }>(
+    "/portfolio/:account/positions",
+    async (request) => {
+      const account = addressSchema.parse(request.params.account) as Address;
+      const query = portfolioQuerySchema.parse(request.query);
+      const positions = await loadPortfolioPositions(store, clobChain, account, query.marketIds);
+      return { account, collateral: positions.collateral, positions: positions.positions };
+    }
+  );
 }
 
 function hasFixtureMismatch(market: MarketDefinition, resultFixtureId: string): boolean {
@@ -993,4 +1041,32 @@ function refreshStoredOrderStatus(
   }
 
   return order;
+}
+
+async function loadPortfolioPositions(
+  store: InMemoryStore,
+  clobChain: ClobRouteChain,
+  account: Address,
+  marketIds?: string[] | undefined
+) {
+  const markets = portfolioMarketCandidates(store, account, marketIds);
+  const balances = await clobChain.getAccountPortfolioBalances(account, markets);
+  const byMarketId = new Map(balances.markets.map((market) => [market.marketId, market]));
+  const positions = markets.flatMap((market) => {
+    const balance = byMarketId.get(market.id);
+    if (!balance) return [];
+
+    return [
+      enrichPortfolioPosition({
+        market,
+        token0: balance.token0,
+        token1: balance.token1,
+        balance0: balance.balance0,
+        balance1: balance.balance1,
+        resolution: store.getResolution(market.id)
+      })
+    ];
+  });
+
+  return { collateral: balances.collateral, positions };
 }

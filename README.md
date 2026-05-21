@@ -174,3 +174,20 @@ CLOB_ORDER_RATE_LIMIT_WINDOW=1 minute
 ```
 
 Accepted order preparation and signed order submission events are written to Fastify logs with market, order, side, maker, and client IP fields. Signatures and API keys are not logged.
+
+## Portfolio API
+
+User portfolio endpoints combine stored CLOB activity with current chain balances:
+
+- `GET /portfolio/:account` returns collateral balance, positions, open and historical orders, trades, and fills.
+- `GET /portfolio/:account/orders` returns the user's open and historical orders.
+- `GET /portfolio/:account/trades` returns trades and fills touched by the user's orders.
+- `GET /portfolio/:account/positions` returns collateral and per-market outcome token balances.
+
+Portfolio and positions requests accept an optional comma-separated `marketIds` query value to limit chain balance reads:
+
+```text
+/portfolio/0x.../positions?marketIds=market-a,market-b
+```
+
+Position rows include outcome-token balances and resolution state. An outcome is marked `redeemable` when the backend has a submitted resolution for that outcome and the user holds a positive winning-token balance.

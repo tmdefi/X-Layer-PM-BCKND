@@ -8,6 +8,7 @@ import {
 import { randomBytes } from "node:crypto";
 import { env } from "../config/env.js";
 import type { OutcomeSide } from "../markets/types.js";
+import type { MarketDefinition } from "../markets/types.js";
 import type { ClobOrderSide, ExchangeOrder, StoredClobOrder } from "../trading/types.js";
 import { ctfExchangeAbi, erc1155ConditionalTokensAbi, erc20CollateralAbi } from "./abis.js";
 import { createChainClients, createPublicChainClient, requireAddress } from "./client.js";
@@ -102,6 +103,24 @@ export type ExchangeOrderReadinessInput = {
   makerAmount: string;
 };
 
+export type AccountMarketOutcomeBalances = {
+  marketId: string;
+  conditionId: Hex;
+  token0: string;
+  token1: string;
+  balance0: string;
+  balance1: string;
+};
+
+export type AccountPortfolioBalances = {
+  account: Address;
+  collateral: {
+    address: Address;
+    balance: string;
+  };
+  markets: AccountMarketOutcomeBalances[];
+};
+
 export type ExchangeOrderReadiness = {
   ready: boolean;
   marketId: string;
@@ -193,6 +212,60 @@ export async function getExchangeOrderReadiness(input: ExchangeOrderReadinessInp
     balance: balance.toString(),
     approved
   });
+}
+
+export async function getAccountPortfolioBalances(
+  account: Address,
+  markets: MarketDefinition[]
+): Promise<AccountPortfolioBalances> {
+  const publicClient = createPublicChainClient();
+  const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+  const conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
+  const collateralBalance = await publicClient.readContract({
+    address: collateral,
+    abi: erc20CollateralAbi,
+    functionName: "balanceOf",
+    args: [account]
+  });
+  const marketBalances = await Promise.all(
+    markets.map(async (market) => {
+      const stored = await getMarketOnChain(market.id);
+      if (!stored) return undefined;
+
+      const [balance0, balance1] = await Promise.all([
+        publicClient.readContract({
+          address: conditionalTokens,
+          abi: erc1155ConditionalTokensAbi,
+          functionName: "balanceOf",
+          args: [account, BigInt(stored.token0)]
+        }),
+        publicClient.readContract({
+          address: conditionalTokens,
+          abi: erc1155ConditionalTokensAbi,
+          functionName: "balanceOf",
+          args: [account, BigInt(stored.token1)]
+        })
+      ]);
+
+      return {
+        marketId: market.id,
+        conditionId: stored.conditionId,
+        token0: stored.token0,
+        token1: stored.token1,
+        balance0: balance0.toString(),
+        balance1: balance1.toString()
+      };
+    })
+  );
+
+  return {
+    account,
+    collateral: {
+      address: collateral,
+      balance: collateralBalance.toString()
+    },
+    markets: marketBalances.filter(isAccountMarketOutcomeBalances)
+  };
 }
 
 export function buildBuyOrderReadiness(input: {
@@ -424,4 +497,10 @@ function orderMessage(order: ExchangeOrder) {
 
 function randomSalt(): string {
   return BigInt(`0x${randomBytes(32).toString("hex")}`).toString();
+}
+
+function isAccountMarketOutcomeBalances(
+  market: AccountMarketOutcomeBalances | undefined
+): market is AccountMarketOutcomeBalances {
+  return Boolean(market);
 }

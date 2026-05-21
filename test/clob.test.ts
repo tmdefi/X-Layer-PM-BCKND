@@ -85,7 +85,8 @@ test("signed order submission rejects missing balance or approval before signatu
     validateExchangeOrder: async () => {
       validateCalled = true;
       return `0x${"b".repeat(64)}` as Hex;
-    }
+    },
+    getAccountPortfolioBalances: async () => portfolioBalances()
   });
   const response = await app.inject({
     method: "POST",
@@ -164,7 +165,14 @@ test("matcher selects best price then order time", () => {
 test("fill bookkeeping records trades and partial or full order remaining sizes", () => {
   const store = new InMemoryStore();
   const taker = storedOrder({ id: "buy", side: "BUY", makerAmount: "60", takerAmount: "100", remainingMaker: "60" });
-  const makerSell = storedOrder({ id: "sell", side: "SELL", makerAmount: "40", takerAmount: "24", remainingMaker: "40" });
+  const makerSell = storedOrder({
+    id: "sell",
+    side: "SELL",
+    makerAmount: "40",
+    takerAmount: "24",
+    remainingMaker: "40",
+    maker: makerTwo
+  });
   store.upsertClobOrder(taker);
   store.upsertClobOrder(makerSell);
 
@@ -189,7 +197,8 @@ test("matcher and operator endpoints are protected", async () => {
   const app = await testApp(marketStore(), {
     getMarketOnChain: async () => storedMarket(),
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
-    validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex
+    validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
+    getAccountPortfolioBalances: async () => portfolioBalances()
   });
 
   const match = await app.inject({ method: "POST", url: "/clob/matches", payload: {} });
@@ -197,6 +206,62 @@ test("matcher and operator endpoints are protected", async () => {
 
   assert.ok([401, 503].includes(match.statusCode));
   assert.ok([401, 503].includes(tick.statusCode));
+  await app.close();
+});
+
+test("portfolio summarizes orders, fills, balances, and redeemable submitted positions", async () => {
+  const store = marketStore();
+  const market = store.getMarket("market-1");
+  assert.ok(market);
+  store.upsertMarket({ ...market, conditionId: storedMarket().conditionId });
+  store.upsertResolution({
+    marketId: "market-1",
+    marketType: "YES_NO",
+    outcome: "YES",
+    payoutVector: [0, 1],
+    status: "submitted",
+    source: { provider: "test" },
+    observedAt: "2026-05-21T00:00:00.000Z",
+    computedAt: "2026-05-21T00:00:01.000Z",
+    reason: "test"
+  });
+  const taker = storedOrder({ id: "buy", side: "BUY", makerAmount: "60", takerAmount: "100", remainingMaker: "60" });
+  const makerSell = storedOrder({
+    id: "sell",
+    side: "SELL",
+    makerAmount: "40",
+    takerAmount: "24",
+    remainingMaker: "40",
+    maker: makerTwo
+  });
+  store.upsertClobOrder(taker);
+  store.upsertClobOrder(makerSell);
+  recordMatchResult(store, manualMatchPlan({
+    takerOrder: taker,
+    makerOrders: [makerSell],
+    takerFillAmount: "24",
+    makerFillAmounts: ["40"]
+  }), transactionHash);
+
+  const app = await testApp(store, {
+    getMarketOnChain: async () => storedMarket(),
+    getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
+    validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
+    getAccountPortfolioBalances: async () => portfolioBalances()
+  });
+  const response = await app.inject({
+    method: "GET",
+    url: `/portfolio/${maker}?marketIds=market-1`
+  });
+  const body = response.json();
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.collateral.balance, "700");
+  assert.equal(body.orders.open.length, 1);
+  assert.equal(body.trades.length, 1);
+  assert.equal(body.fills.length, 1);
+  assert.equal(body.positions[0].outcomes[1].balance, "80");
+  assert.equal(body.positions[0].outcomes[1].redeemable, true);
   await app.close();
 });
 
@@ -224,6 +289,21 @@ function storedMarket() {
   };
 }
 
+function portfolioBalances() {
+  return {
+    account: maker,
+    collateral: { address: collateral, balance: "700" },
+    markets: [{
+      marketId: "market-1",
+      conditionId: storedMarket().conditionId,
+      token0: "10",
+      token1: "20",
+      balance0: "0",
+      balance1: "80"
+    }]
+  };
+}
+
 function unreadyBuyReadiness(): ExchangeOrderReadiness {
   return buildBuyOrderReadiness({
     marketId: "market-1",
@@ -246,6 +326,7 @@ function storedOrder(input: {
   remainingMaker: string;
   createdAt?: string | undefined;
   status?: StoredClobOrder["status"] | undefined;
+  maker?: Address | undefined;
 }): StoredClobOrder {
   const createdAt = input.createdAt ?? "2026-05-21T00:00:00.000Z";
   return {
@@ -262,7 +343,8 @@ function storedOrder(input: {
       tokenId: "20",
       side: input.side === "BUY" ? 0 : 1,
       makerAmount: input.makerAmount,
-      takerAmount: input.takerAmount
+      takerAmount: input.takerAmount,
+      maker: input.maker
     })
   };
 }
@@ -272,11 +354,12 @@ function exchangeOrder(input: {
   side: 0 | 1;
   makerAmount: string;
   takerAmount: string;
+  maker?: Address | undefined;
 }): ExchangeOrder {
   return {
     salt: "1",
-    maker,
-    signer: maker,
+    maker: input.maker ?? maker,
+    signer: input.maker ?? maker,
     taker: "0x0000000000000000000000000000000000000000",
     tokenId: input.tokenId,
     makerAmount: input.makerAmount,
