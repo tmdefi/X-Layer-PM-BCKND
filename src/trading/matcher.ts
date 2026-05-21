@@ -125,6 +125,10 @@ export async function executeMatchPlan(store: InMemoryStore, plan: MatchPlan): P
   return recordSuccessfulMatch(store, plan, transactionHash);
 }
 
+export function recordMatchResult(store: InMemoryStore, plan: MatchPlan, transactionHash: Hex): MatchResult {
+  return recordSuccessfulMatch(store, plan, transactionHash);
+}
+
 export function manualMatchPlan(input: {
   takerOrder: StoredClobOrder;
   makerOrders: StoredClobOrder[];

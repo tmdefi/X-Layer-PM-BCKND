@@ -1,5 +1,6 @@
 import {
   encodeFunctionData,
+  maxUint256,
   type Address,
   type Hex,
   zeroAddress
@@ -8,8 +9,8 @@ import { randomBytes } from "node:crypto";
 import { env } from "../config/env.js";
 import type { OutcomeSide } from "../markets/types.js";
 import type { ClobOrderSide, ExchangeOrder, StoredClobOrder } from "../trading/types.js";
-import { ctfExchangeAbi } from "./abis.js";
-import { createChainClients, requireAddress } from "./client.js";
+import { ctfExchangeAbi, erc1155ConditionalTokensAbi, erc20CollateralAbi } from "./abis.js";
+import { createChainClients, createPublicChainClient, requireAddress } from "./client.js";
 import { getMarketOnChain } from "./markets.js";
 
 export const exchangeDomain = {
@@ -51,8 +52,8 @@ export async function prepareExchangeOrder(input: {
   const market = await getMarketOnChain(input.marketId);
   if (!market) throw new Error(`Market ${input.marketId} has not been created on-chain`);
 
-  const clients = createChainClients();
-  const nonce = await clients.publicClient.readContract({
+  const publicClient = createPublicChainClient();
+  const nonce = await publicClient.readContract({
     address: exchange,
     abi: ctfExchangeAbi,
     functionName: "nonces",
@@ -93,6 +94,179 @@ export async function prepareExchangeOrder(input: {
   };
 }
 
+export type ExchangeOrderReadinessInput = {
+  marketId: string;
+  outcomeSide: OutcomeSide;
+  maker: Address;
+  side: ClobOrderSide;
+  makerAmount: string;
+};
+
+export type ExchangeOrderReadiness = {
+  ready: boolean;
+  marketId: string;
+  outcomeSide: OutcomeSide;
+  side: ClobOrderSide;
+  maker: Address;
+  tokenId: string;
+  exchange: Address;
+  asset: {
+    kind: "COLLATERAL" | "CONDITIONAL_TOKEN";
+    address: Address;
+    requiredAmount: string;
+    balance: string;
+    hasBalance: boolean;
+  };
+  approval: {
+    approved: boolean;
+    allowance?: string | undefined;
+    transaction?: { to: Address; data: Hex } | undefined;
+  };
+};
+
+export async function getExchangeOrderReadiness(input: ExchangeOrderReadinessInput): Promise<ExchangeOrderReadiness> {
+  const market = await getMarketOnChain(input.marketId);
+  if (!market) throw new Error(`Market ${input.marketId} has not been created on-chain`);
+
+  const publicClient = createPublicChainClient();
+  const exchange = exchangeAddress();
+  const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+  const conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
+  const tokenId = input.outcomeSide === "NO" || input.outcomeSide === "UNDER" ? market.token0 : market.token1;
+  const requiredAmount = BigInt(input.makerAmount);
+
+  if (input.side === "BUY") {
+    const [balance, allowance] = await Promise.all([
+      publicClient.readContract({
+        address: collateral,
+        abi: erc20CollateralAbi,
+        functionName: "balanceOf",
+        args: [input.maker]
+      }),
+      publicClient.readContract({
+        address: collateral,
+        abi: erc20CollateralAbi,
+        functionName: "allowance",
+        args: [input.maker, exchange]
+      })
+    ]);
+    const hasBalance = balance >= requiredAmount;
+    const approved = allowance >= requiredAmount;
+
+    return buildBuyOrderReadiness({
+      marketId: input.marketId,
+      outcomeSide: input.outcomeSide,
+      maker: input.maker,
+      tokenId,
+      exchange,
+      collateral,
+      requiredAmount: input.makerAmount,
+      balance: balance.toString(),
+      allowance: allowance.toString()
+    });
+  }
+
+  const [balance, approved] = await Promise.all([
+    publicClient.readContract({
+      address: conditionalTokens,
+      abi: erc1155ConditionalTokensAbi,
+      functionName: "balanceOf",
+      args: [input.maker, BigInt(tokenId)]
+    }),
+    publicClient.readContract({
+      address: conditionalTokens,
+      abi: erc1155ConditionalTokensAbi,
+      functionName: "isApprovedForAll",
+      args: [input.maker, exchange]
+    })
+  ]);
+  const hasBalance = balance >= requiredAmount;
+
+  return buildSellOrderReadiness({
+    marketId: input.marketId,
+    outcomeSide: input.outcomeSide,
+    maker: input.maker,
+    tokenId,
+    exchange,
+    conditionalTokens,
+    requiredAmount: input.makerAmount,
+    balance: balance.toString(),
+    approved
+  });
+}
+
+export function buildBuyOrderReadiness(input: {
+  marketId: string;
+  outcomeSide: OutcomeSide;
+  maker: Address;
+  tokenId: string;
+  exchange: Address;
+  collateral: Address;
+  requiredAmount: string;
+  balance: string;
+  allowance: string;
+}): ExchangeOrderReadiness {
+  const hasBalance = BigInt(input.balance) >= BigInt(input.requiredAmount);
+  const approved = BigInt(input.allowance) >= BigInt(input.requiredAmount);
+
+  return {
+    ready: hasBalance && approved,
+    marketId: input.marketId,
+    outcomeSide: input.outcomeSide,
+    side: "BUY",
+    maker: input.maker,
+    tokenId: input.tokenId,
+    exchange: input.exchange,
+    asset: {
+      kind: "COLLATERAL",
+      address: input.collateral,
+      requiredAmount: input.requiredAmount,
+      balance: input.balance,
+      hasBalance
+    },
+    approval: {
+      approved,
+      allowance: input.allowance,
+      ...(!approved ? { transaction: collateralApprovalTransaction(input.collateral, input.exchange) } : {})
+    }
+  };
+}
+
+export function buildSellOrderReadiness(input: {
+  marketId: string;
+  outcomeSide: OutcomeSide;
+  maker: Address;
+  tokenId: string;
+  exchange: Address;
+  conditionalTokens: Address;
+  requiredAmount: string;
+  balance: string;
+  approved: boolean;
+}): ExchangeOrderReadiness {
+  const hasBalance = BigInt(input.balance) >= BigInt(input.requiredAmount);
+
+  return {
+    ready: hasBalance && input.approved,
+    marketId: input.marketId,
+    outcomeSide: input.outcomeSide,
+    side: "SELL",
+    maker: input.maker,
+    tokenId: input.tokenId,
+    exchange: input.exchange,
+    asset: {
+      kind: "CONDITIONAL_TOKEN",
+      address: input.conditionalTokens,
+      requiredAmount: input.requiredAmount,
+      balance: input.balance,
+      hasBalance
+    },
+    approval: {
+      approved: input.approved,
+      ...(!input.approved ? { transaction: conditionalTokensApprovalTransaction(input.conditionalTokens, input.exchange) } : {})
+    }
+  };
+}
+
 export async function validateExchangeOrder(order: ExchangeOrder): Promise<Hex> {
   const clients = createChainClients();
   const exchange = exchangeAddress();
@@ -114,8 +288,8 @@ export async function validateExchangeOrder(order: ExchangeOrder): Promise<Hex> 
 }
 
 export async function getExchangeNonce(maker: Address): Promise<string> {
-  const clients = createChainClients();
-  const nonce = await clients.publicClient.readContract({
+  const publicClient = createPublicChainClient();
+  const nonce = await publicClient.readContract({
     address: exchangeAddress(),
     abi: ctfExchangeAbi,
     functionName: "nonces",
@@ -125,9 +299,9 @@ export async function getExchangeNonce(maker: Address): Promise<string> {
 }
 
 export async function getExchangeOrderStatus(orderHash: Hex) {
-  const clients = createChainClients();
+  const publicClient = createPublicChainClient();
   const [status] = await Promise.all([
-    clients.publicClient.readContract({
+    publicClient.readContract({
       address: exchangeAddress(),
       abi: ctfExchangeAbi,
       functionName: "getOrderStatus",
@@ -158,6 +332,28 @@ export function incrementNonceTransaction() {
     data: encodeFunctionData({
       abi: ctfExchangeAbi,
       functionName: "incrementNonce"
+    })
+  };
+}
+
+function collateralApprovalTransaction(collateral: Address, exchange: Address) {
+  return {
+    to: collateral,
+    data: encodeFunctionData({
+      abi: erc20CollateralAbi,
+      functionName: "approve",
+      args: [exchange, maxUint256]
+    })
+  };
+}
+
+function conditionalTokensApprovalTransaction(conditionalTokens: Address, exchange: Address) {
+  return {
+    to: conditionalTokens,
+    data: encodeFunctionData({
+      abi: erc1155ConditionalTokensAbi,
+      functionName: "setApprovalForAll",
+      args: [exchange, true]
     })
   };
 }

@@ -189,6 +189,14 @@ export const prepareClobOrderSchema = z.object({
   signatureType: z.union([z.literal(0), z.literal(1)]).optional()
 });
 
+export const clobOrderReadinessSchema = prepareClobOrderSchema.pick({
+  marketId: true,
+  outcomeSide: true,
+  maker: true,
+  side: true,
+  makerAmount: true
+});
+
 export const submitClobOrderSchema = z.object({
   marketId: z.string().min(1),
   outcomeSide: binaryOutcomeSideSchema,

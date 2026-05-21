@@ -6,6 +6,7 @@ import {
   createMarketOnChain,
   getExchangeNonce,
   getExchangeOrderStatus,
+  getExchangeOrderReadiness,
   getMarketOnChain,
   hashIdentifier,
   incrementNonceTransaction,
@@ -50,6 +51,7 @@ import {
 import type { ExchangeOrder, StoredClobOrder } from "../trading/index.js";
 import {
   autoMainCardPlayerMarketsSchema,
+  clobOrderReadinessSchema,
   createMarketOnChainSchema,
   createMainCardPlayerMarketsSchema,
   createPlayerMarketsSchema,
@@ -66,12 +68,25 @@ import {
   tickClobMatcherSchema
 } from "./schemas.js";
 
+export type ClobRouteChain = {
+  getMarketOnChain: typeof getMarketOnChain;
+  getExchangeOrderReadiness: typeof getExchangeOrderReadiness;
+  validateExchangeOrder: typeof validateExchangeOrder;
+};
+
+const defaultClobRouteChain: ClobRouteChain = {
+  getMarketOnChain,
+  getExchangeOrderReadiness,
+  validateExchangeOrder
+};
+
 export async function registerRoutes(
   app: FastifyInstance,
   store: InMemoryStore,
   sourceRegistry: SourceRegistry,
   settlementWorker?: SettlementWorker,
-  syncWorker?: ProviderSyncWorker
+  syncWorker?: ProviderSyncWorker,
+  clobChain: ClobRouteChain = defaultClobRouteChain
 ): Promise<void> {
   app.get("/health", async () => ({
     ok: true,
@@ -553,12 +568,21 @@ export async function registerRoutes(
     if (!market) return reply.code(404).send({ error: "Market not found" });
     if (market.status !== "open") return reply.code(400).send({ error: "Only open markets accept orders" });
 
-    const prepared = await prepareExchangeOrder({
-      ...input,
-      maker: input.maker as Address,
-      signer: input.signer as Address | undefined,
-      taker: input.taker as Address | undefined
-    });
+    const [prepared, readiness] = await Promise.all([
+      prepareExchangeOrder({
+        ...input,
+        maker: input.maker as Address,
+        signer: input.signer as Address | undefined,
+        taker: input.taker as Address | undefined
+      }),
+      clobChain.getExchangeOrderReadiness({
+        marketId: input.marketId,
+        outcomeSide: input.outcomeSide,
+        maker: input.maker as Address,
+        side: input.side,
+        makerAmount: input.makerAmount
+      })
+    ]);
 
     request.log.info({
       marketId: market.id,
@@ -571,8 +595,24 @@ export async function registerRoutes(
     return reply.code(201).send({
       market,
       order: prepared.order,
-      typedData: prepared.typedData
+      typedData: prepared.typedData,
+      readiness
     });
+  });
+
+  app.post("/clob/orders/readiness", async (request, reply) => {
+    const input = clobOrderReadinessSchema.parse(request.body);
+    const market = store.getMarket(input.marketId);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+    if (market.status !== "open") return reply.code(400).send({ error: "Only open markets accept orders" });
+
+    return {
+      market,
+      readiness: await clobChain.getExchangeOrderReadiness({
+        ...input,
+        maker: input.maker as Address
+      })
+    };
   });
 
   app.post("/clob/orders", {
@@ -588,7 +628,7 @@ export async function registerRoutes(
     if (!market) return reply.code(404).send({ error: "Market not found" });
     if (market.status !== "open") return reply.code(400).send({ error: "Only open markets accept orders" });
 
-    const storedMarket = await getMarketOnChain(input.marketId);
+    const storedMarket = await clobChain.getMarketOnChain(input.marketId);
     if (!storedMarket) return reply.code(400).send({ error: "Market has not been created on-chain" });
 
     const expectedTokenId =
@@ -597,7 +637,21 @@ export async function registerRoutes(
       return reply.code(400).send({ error: "Order tokenId does not match the requested market outcome" });
     }
 
-    const orderHash = await validateExchangeOrder(input.order as ExchangeOrder);
+    const readiness = await clobChain.getExchangeOrderReadiness({
+      marketId: input.marketId,
+      outcomeSide: input.outcomeSide,
+      maker: input.order.maker as Address,
+      side: input.order.side === 0 ? "BUY" : "SELL",
+      makerAmount: input.order.makerAmount
+    });
+    if (!readiness.ready) {
+      return reply.code(400).send({
+        error: "Order maker balance or exchange approval is not ready",
+        readiness
+      });
+    }
+
+    const orderHash = await clobChain.validateExchangeOrder(input.order as ExchangeOrder);
     const existing = store.getClobOrderByHash(orderHash);
     if (existing) {
       request.log.info({
@@ -662,6 +716,7 @@ export async function registerRoutes(
 
     return reply.code(201).send({
       order: store.getClobOrder(stored.id) ?? stored,
+      readiness,
       autoMatch
     });
   });

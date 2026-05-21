@@ -110,6 +110,7 @@ Common commands:
 ```sh
 npm run prisma:generate
 npm run prisma:deploy
+npm test
 ```
 
 ## Automated Sync
@@ -128,11 +129,12 @@ SYNC_ON_CHAIN_MARKET_LIMIT=50
 
 Trading uses off-chain signed EIP-712 orders and operator-submitted matches on `CTFExchange`.
 
-1. `POST /clob/orders/prepare` resolves `marketId + outcomeSide` to the on-chain token id and returns an unsigned order plus typed data for the maker wallet.
-2. The wallet signs the typed data and the client submits the signed order to `POST /clob/orders`.
-3. The backend stores open orders and serves `GET /markets/:id/orderbook` and `GET /markets/:id/trades`.
-4. The matcher checks accepted signed orders for crossing BUY/SELL liquidity on the same outcome and submits matches through the operator wallet.
-5. Manual operator matching remains available through `POST /clob/matches`; trades, fills, and order remaining sizes are persisted.
+1. `POST /clob/orders/readiness` checks the maker balance and exchange approval for the planned BUY or SELL order.
+2. `POST /clob/orders/prepare` resolves `marketId + outcomeSide` to the on-chain token id and returns an unsigned order, typed data for the maker wallet, and the same readiness data.
+3. The wallet signs the typed data and the client submits the signed order to `POST /clob/orders`.
+4. The backend stores open orders and serves `GET /markets/:id/orderbook` and `GET /markets/:id/trades`.
+5. The matcher checks accepted signed orders for crossing BUY/SELL liquidity on the same outcome and submits matches through the operator wallet.
+6. Manual operator matching remains available through `POST /clob/matches`; trades, fills, and order remaining sizes are persisted.
 
 Maker-wallet maintenance routes:
 
@@ -142,6 +144,13 @@ Maker-wallet maintenance routes:
 - `POST /clob/orders/:id/sync-status` refreshes backend order visibility after a cancellation or nonce change reaches the chain.
 
 The exchange EIP-712 domain name remains the deployed contract domain used by `CTFExchange`; clients should sign the typed-data payload returned by the backend rather than hard-coding a renamed domain.
+
+Order readiness uses the maker amount:
+
+- `BUY` requires enough collateral balance and ERC20 allowance from the maker to `CTFExchange`.
+- `SELL` requires enough Conditional Tokens balance for the outcome token id and ERC1155 operator approval from the maker to `CTFExchange`.
+
+When approval is missing, readiness includes a wallet transaction payload for collateral `approve` or Conditional Tokens `setApprovalForAll`. Signed order submission rejects an order that is not ready, so unapproved or underfunded orders are not passed into automatic matching.
 
 Automatic matching is enabled by default:
 

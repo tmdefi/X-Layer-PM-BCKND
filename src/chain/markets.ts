@@ -1,7 +1,7 @@
 import { decodeEventLog, keccak256, stringToHex, type Address, type Hex, type TransactionReceipt } from "viem";
 import { env } from "../config/env.js";
 import { binaryMarketResolverAbi, marketFactoryAbi } from "./abis.js";
-import { createChainClients, requireAddress } from "./client.js";
+import { createChainClients, createPublicChainClient, requireAddress } from "./client.js";
 
 export type OnChainMarketCreationInput = {
   marketId: string;
@@ -73,9 +73,9 @@ export async function createMarketOnChain(
 }
 
 export async function getMarketOnChain(marketId: string): Promise<OnChainStoredMarket | undefined> {
-  const clients = createChainClients();
+  const publicClient = createPublicChainClient();
   const marketFactory = requireAddress(env.MARKET_FACTORY_ADDRESS, "MARKET_FACTORY_ADDRESS");
-  const stored = await clients.publicClient.readContract({
+  const stored = await publicClient.readContract({
     address: marketFactory,
     abi: marketFactoryAbi,
     functionName: "markets",
