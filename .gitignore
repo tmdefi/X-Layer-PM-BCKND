@@ -65,12 +65,12 @@ web_modules/
 # Yarn Integrity file
 .yarn-integrity
 
-# dotenv environment variable files
+# Local secrets and environment overrides.
 .env
 .env.*
 !.env.example
 
-# parcel-bundler cache (https://parceljs.org/)
+# Parcel cache
 .cache
 .parcel-cache
 
@@ -85,23 +85,20 @@ dist
 
 # Gatsby files
 .cache/
-# Comment in the public line in if your project uses Gatsby and not Next.js
-# https://nextjs.org/blog/next-9-1#public-directory-support
-# public
 
-# vuepress build output
+# VuePress build output
 .vuepress/dist
 
-# vuepress v2.x temp directory
+# VuePress v2.x temp directory
 .temp
 
-# Sveltekit cache directory
+# SvelteKit cache directory
 .svelte-kit/
 
-# vitepress build output
+# VitePress build output
 **/.vitepress/dist
 
-# vitepress cache directory
+# VitePress cache directory
 **/.vitepress/cache
 
 # Docusaurus cache and generated files

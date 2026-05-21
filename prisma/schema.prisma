@@ -1,0 +1,93 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Fixture {
+  id             String   @id
+  sport          String
+  source         Json
+  homeCompetitor String
+  awayCompetitor String
+  homeLogoUrl    String?
+  awayLogoUrl    String?
+  kickoffTime    DateTime
+  status         String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  markets Market[]
+
+  @@index([sport, kickoffTime])
+  @@index([status, kickoffTime])
+}
+
+model Market {
+  id          String   @id
+  fixtureId   String?
+  type        String
+  title       String
+  status      String
+  source      Json?
+  resolver    Json?
+  outcomes    Json
+  conditionId String?
+  template    Json?
+  sport       String?
+  line        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  fixture    Fixture?    @relation(fields: [fixtureId], references: [id], onDelete: SetNull)
+  resolution Resolution?
+
+  @@index([fixtureId])
+  @@index([status])
+  @@index([type])
+}
+
+model Resolution {
+  marketId     String   @id
+  marketType   String
+  outcome      String
+  payoutVector Json
+  status       String
+  source       Json
+  observedAt   DateTime
+  computedAt   DateTime
+  reason       String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  market Market @relation(fields: [marketId], references: [id], onDelete: Cascade)
+
+  @@index([status])
+  @@index([computedAt])
+}
+
+model FixtureInsightsCache {
+  cacheKey  String   @id
+  insights  Json
+  cachedAt  DateTime
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
+model ProviderSyncLog {
+  id         String   @id @default(cuid())
+  provider   String
+  jobType    String
+  status     String
+  startedAt  DateTime @default(now())
+  finishedAt DateTime?
+  details    Json?
+
+  @@index([provider, jobType, startedAt])
+  @@index([status, startedAt])
+}
