@@ -3,6 +3,7 @@ import {
   maxUint256,
   type Address,
   type Hex,
+  zeroHash,
   zeroAddress
 } from "viem";
 import { randomBytes } from "node:crypto";
@@ -265,6 +266,23 @@ export async function getAccountPortfolioBalances(
       balance: collateralBalance.toString()
     },
     markets: marketBalances.filter(isAccountMarketOutcomeBalances)
+  };
+}
+
+export async function redemptionTransaction(marketId: string) {
+  const stored = await getMarketOnChain(marketId);
+  if (!stored) throw new Error(`Market ${marketId} has not been created on-chain`);
+
+  const conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
+  const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+
+  return {
+    to: conditionalTokens,
+    data: encodeFunctionData({
+      abi: erc1155ConditionalTokensAbi,
+      functionName: "redeemPositions",
+      args: [collateral, zeroHash, stored.conditionId, [1n, 2n]]
+    })
   };
 }
 

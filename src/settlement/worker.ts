@@ -1,6 +1,11 @@
 import { env } from "../config/env.js";
 import { hashIdentifier, outcomeSideToResolverOutcome, resolveMarketOnChain } from "../chain/index.js";
-import { computeResolutionDecision } from "../markets/resolution.js";
+import {
+  computeEarlyResolutionDecision,
+  computeResolutionDecision,
+  confirmEarlyResolutionDecision
+} from "../markets/resolution.js";
+import { footballLiveTradingCloseReason } from "../markets/live-trading.js";
 import type {
   FixtureStatus,
   MarketDefinition,
@@ -41,6 +46,8 @@ export type SettlementRunSummary = {
   liveFixtures: number;
   liveTransitions: number;
   computedResolutions: number;
+  closedLiveMarkets: number;
+  earlyResolutions: number;
   submittedOnChain: number;
   skippedMarkets: number;
   errors: string[];
@@ -109,6 +116,8 @@ export class SettlementWorker {
         liveFixtures: 0,
         liveTransitions: 0,
         computedResolutions: 0,
+        closedLiveMarkets: 0,
+        earlyResolutions: 0,
         submittedOnChain: 0,
         skippedMarkets: 0,
         errors: ["Settlement worker is already running"]
@@ -124,6 +133,8 @@ export class SettlementWorker {
       liveFixtures: 0,
       liveTransitions: 0,
       computedResolutions: 0,
+      closedLiveMarkets: 0,
+      earlyResolutions: 0,
       submittedOnChain: 0,
       skippedMarkets: 0,
       errors: []
@@ -152,6 +163,7 @@ export class SettlementWorker {
       for (const group of groups) {
         if (transitionedKeys.has(groupKey(group))) continue;
         if (this.liveFixtureKeys.has(liveKey(group.provider, group.externalFixtureId))) {
+          await this.applyLiveTradingRules(group, summary);
           summary.skippedMarkets += group.markets.length;
           continue;
         }
@@ -179,21 +191,7 @@ export class SettlementWorker {
           ? computeResolutionDecision(market, result)
           : createVoidDecision(market, result);
 
-      this.options.store.upsertResolution(decision);
-      this.options.store.updateMarket({
-        ...market,
-        status: decision.outcome === "VOID" ? "cancelled" : "resolved"
-      });
-      summary.computedResolutions += 1;
-
-      if (this.submitOnChain && decision.outcome !== "VOID") {
-        await resolveMarketOnChain(hashIdentifier(market.id), outcomeSideToResolverOutcome(decision.outcome));
-        this.options.store.upsertResolution({
-          ...decision,
-          status: "submitted"
-        });
-        summary.submittedOnChain += 1;
-      }
+      await this.storeResolvedMarket(market, decision, summary);
     } catch (error) {
       summary.errors.push(errorMessage(error));
     }
@@ -219,6 +217,91 @@ export class SettlementWorker {
     } catch (error) {
       summary.errors.push(errorMessage(error));
     }
+  }
+
+  private async applyLiveTradingRules(group: SettlementGroup, summary: SettlementRunSummary): Promise<void> {
+    try {
+      const result = await this.options.sourceRegistry
+        .get(group.provider)
+        .getFixtureResult(group.externalFixtureId);
+
+      if (result.status !== "live") return;
+      if (result.score) {
+        this.options.store.publishMarketEvent({
+          type: "fixture.live_score_updated",
+          fixtureId: result.fixtureId,
+          score: result.score,
+          observedAt: result.observedAt,
+          source: result.source
+        });
+      }
+
+      for (const market of group.markets) {
+        const observedEarlyDecision = computeEarlyResolutionDecision(market, result);
+        if (observedEarlyDecision) {
+          const earlyDecision = confirmEarlyResolutionDecision(
+            this.options.store.getResolution(market.id),
+            observedEarlyDecision
+          );
+          if (earlyDecision.earlyResolution?.confirmedAt) {
+            await this.storeResolvedMarket(market, earlyDecision, summary);
+            summary.earlyResolutions += 1;
+          } else {
+            this.storeEarlyResolutionCandidate(market, earlyDecision);
+          }
+          continue;
+        }
+
+        const reason = footballLiveTradingCloseReason(market, result);
+        if (!reason) continue;
+
+        this.options.store.updateMarket({
+          ...market,
+          tradingStatus: "closed",
+          tradingStatusReason: reason,
+          tradingStatusUpdatedAt: result.observedAt
+        });
+        summary.closedLiveMarkets += 1;
+      }
+    } catch (error) {
+      summary.errors.push(errorMessage(error));
+    }
+  }
+
+  private async storeResolvedMarket(
+    market: MarketDefinition,
+    decision: ResolutionDecision,
+    summary: SettlementRunSummary
+  ): Promise<void> {
+    this.options.store.upsertResolution(decision);
+    this.options.store.updateMarket({
+      ...market,
+      status: decision.outcome === "VOID" ? "cancelled" : "resolved",
+      tradingStatus: "closed",
+      tradingStatusReason: decision.outcome === "VOID" ? "Fixture voided" : decision.reason,
+      tradingStatusUpdatedAt: decision.computedAt
+    });
+    summary.computedResolutions += 1;
+
+    if (this.submitOnChain && decision.outcome !== "VOID") {
+      await resolveMarketOnChain(hashIdentifier(market.id), outcomeSideToResolverOutcome(decision.outcome));
+      this.options.store.upsertResolution({
+        ...decision,
+        status: "submitted"
+      });
+      summary.submittedOnChain += 1;
+    }
+  }
+
+  private storeEarlyResolutionCandidate(market: MarketDefinition, decision: ResolutionDecision): void {
+    this.options.store.upsertResolution(decision);
+    this.options.store.updateMarket({
+      ...market,
+      status: market.status === "open" ? "closed" : market.status,
+      tradingStatus: "closed",
+      tradingStatusReason: `${decision.reason}; awaiting repeated confirmation`,
+      tradingStatusUpdatedAt: decision.computedAt
+    });
   }
 
   private async refreshLiveFixtures(
@@ -266,7 +349,10 @@ export class SettlementWorker {
       if (!market.fixtureId || market.status === "resolved" || market.status === "cancelled") continue;
 
       const existingResolution = this.options.store.getResolution(market.id);
-      if (existingResolution?.status === "computed" || existingResolution?.status === "reviewed") continue;
+      if (
+        (existingResolution?.status === "computed" || existingResolution?.status === "reviewed") &&
+        !existingResolution.earlyResolution
+      ) continue;
       if (existingResolution?.status === "submitted") continue;
 
       const source = market.resolver?.source ?? market.source;

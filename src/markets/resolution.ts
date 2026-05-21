@@ -1,5 +1,6 @@
 import type {
   MarketDefinition,
+  EarlyResolutionConfirmation,
   PlayerIdentity,
   ProviderFixtureResult,
   ResolutionDecision,
@@ -84,6 +85,63 @@ export function computeResolutionDecision(
   };
 }
 
+export function computeEarlyResolutionDecision(
+  market: MarketDefinition,
+  result: ProviderFixtureResult,
+  computedAt = new Date().toISOString()
+): ResolutionDecision | undefined {
+  if (result.status !== "live") return undefined;
+
+  const outcome = irreversibleLiveOutcome(market, result);
+  if (!outcome) return undefined;
+  const earlyResolution = earlyResolutionConfirmation(market, result, outcome);
+  if (!earlyResolution) return undefined;
+
+  return {
+    marketId: market.id,
+    marketType: market.type,
+    outcome,
+    payoutVector: payoutVectorForOutcome(outcome),
+    status: "computed",
+    source: result.source,
+    observedAt: result.observedAt,
+    computedAt,
+    reason: earlyResolutionReason(market, result, outcome),
+    earlyResolution
+  };
+}
+
+export function confirmEarlyResolutionDecision(
+  existing: ResolutionDecision | undefined,
+  observed: ResolutionDecision,
+  confirmedAt = new Date().toISOString()
+): ResolutionDecision {
+  const observation = observed.earlyResolution;
+  if (!observation) return observed;
+
+  const previous = existing?.earlyResolution;
+  if (
+    !previous ||
+    existing?.outcome !== observed.outcome ||
+    previous.policy !== observation.policy ||
+    previous.evidenceKey !== observation.evidenceKey
+  ) {
+    return observed;
+  }
+
+  const repeated = previous.lastObservedAt !== observation.lastObservedAt;
+  const observationCount = previous.observationCount + (repeated ? 1 : 0);
+  return {
+    ...observed,
+    earlyResolution: {
+      ...observation,
+      observationCount,
+      firstObservedAt: previous.firstObservedAt,
+      ...(observationCount >= 2 ? { confirmedAt } : {})
+    }
+  };
+}
+
 function computeOutcome(market: MarketDefinition, result: ProviderFixtureResult): ResolutionOutcome {
   switch (market.type) {
     case "TOTAL_GOALS":
@@ -165,6 +223,73 @@ function computeOutcome(market: MarketDefinition, result: ProviderFixtureResult)
   }
 }
 
+function irreversibleLiveOutcome(market: MarketDefinition, result: ProviderFixtureResult): ResolutionOutcome | undefined {
+  if (market.type === "TOTAL_GOALS" && result.score) {
+    return result.score.homeGoals + result.score.awayGoals > Number(market.line) ? "OVER" : undefined;
+  }
+
+  if (market.type === "BOTH_TEAMS_TO_SCORE" && result.score) {
+    return result.score.homeGoals > 0 && result.score.awayGoals > 0 ? "YES" : undefined;
+  }
+
+  if (market.type !== "YES_NO") return undefined;
+
+  if (market.resolver?.rule === "HOME_TEAM_SCORE_FIRST") {
+    if (result.homeTeamScoredFirst === undefined || !result.score || result.score.homeGoals + result.score.awayGoals === 0) {
+      return undefined;
+    }
+    return result.homeTeamScoredFirst ? "YES" : "NO";
+  }
+
+  if (market.resolver?.rule === "PLAYER_SCORED" && market.template?.category === "MAIN_PLAYER") {
+    return playerScoredWithStableIdentity(result, market.template.player) ? "YES" : undefined;
+  }
+
+  return undefined;
+}
+
+function earlyResolutionConfirmation(
+  market: MarketDefinition,
+  result: ProviderFixtureResult,
+  outcome: ResolutionOutcome
+): EarlyResolutionConfirmation | undefined {
+  const base = {
+    observationCount: 1,
+    firstObservedAt: result.observedAt,
+    lastObservedAt: result.observedAt
+  };
+
+  if (market.type === "TOTAL_GOALS" || market.type === "BOTH_TEAMS_TO_SCORE") {
+    return {
+      ...base,
+      policy: "REPEATED_SCORE",
+      evidenceKey: `${market.id}:${outcome}`
+    };
+  }
+
+  if (market.type !== "YES_NO") return undefined;
+
+  if (market.resolver?.rule === "HOME_TEAM_SCORE_FIRST" && result.homeTeamScoredFirst !== undefined) {
+    return {
+      ...base,
+      policy: "STABLE_FIRST_GOAL",
+      evidenceKey: `${market.id}:${result.homeTeamScoredFirst ? "home" : "away"}`
+    };
+  }
+
+  if (market.resolver?.rule === "PLAYER_SCORED" && market.template?.category === "MAIN_PLAYER") {
+    const player = market.template.player;
+    if (!player.playerId) return undefined;
+    return {
+      ...base,
+      policy: "STABLE_PLAYER_SCORER",
+      evidenceKey: `${market.id}:${player.provider}:${player.playerId}`
+    };
+  }
+
+  return undefined;
+}
+
 function resolutionReason(
   market: MarketDefinition,
   result: ProviderFixtureResult,
@@ -220,6 +345,31 @@ function resolutionReason(
   return `Explicit oracle outcome: ${outcome}`;
 }
 
+function earlyResolutionReason(
+  market: MarketDefinition,
+  result: ProviderFixtureResult,
+  outcome: ResolutionOutcome
+): string {
+  if (market.type === "TOTAL_GOALS" && result.score) {
+    const totalGoals = result.score.homeGoals + result.score.awayGoals;
+    return `Irreversible live total ${totalGoals} exceeds line ${market.line}: ${outcome}`;
+  }
+
+  if (market.type === "BOTH_TEAMS_TO_SCORE" && result.score) {
+    return `Irreversible live score ${result.score.homeGoals}-${result.score.awayGoals}: ${outcome}`;
+  }
+
+  if (market.type === "YES_NO" && market.resolver?.rule === "HOME_TEAM_SCORE_FIRST") {
+    return `Irreversible live first-goal outcome: home team scored first ${outcome}`;
+  }
+
+  if (market.type === "YES_NO" && market.resolver?.rule === "PLAYER_SCORED" && market.template?.category === "MAIN_PLAYER") {
+    return `Irreversible live scorer event: ${market.template.player.playerName} scored ${outcome}`;
+  }
+
+  return `Irreversible live outcome: ${outcome}`;
+}
+
 function isBasketballWinnerMarket(market: MarketDefinition): boolean {
   return (
     market.type === "YES_NO" &&
@@ -230,11 +380,23 @@ function isBasketballWinnerMarket(market: MarketDefinition): boolean {
 
 function playerScored(result: ProviderFixtureResult, player: PlayerIdentity): boolean {
   if (player.playerId && result.scoringPlayers) {
-    return result.scoringPlayers.some((scorer) => scorer.provider === "api-football" && scorer.playerId === player.playerId);
+    return result.scoringPlayers.some((scorer) =>
+      scorer.provider === player.provider && scorer.playerId === player.playerId
+    );
   }
 
   const expected = normalizePlayerName(player.playerName);
   return (result.scoringPlayerNames ?? []).some((scorer) => normalizePlayerName(scorer) === expected);
+}
+
+function playerScoredWithStableIdentity(result: ProviderFixtureResult, player: PlayerIdentity): boolean {
+  if (!player.playerId || !result.scoringPlayers) return false;
+
+  return result.scoringPlayers.some((scorer) =>
+    Boolean(scorer.playerId) &&
+    scorer.provider === player.provider &&
+    scorer.playerId === player.playerId
+  );
 }
 
 function normalizePlayerName(playerName: string): string {

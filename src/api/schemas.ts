@@ -12,6 +12,8 @@ export const fixtureStatusSchema = z.enum([
 ]);
 
 export const marketStatusSchema = z.enum(["draft", "open", "closed", "resolved", "cancelled"]);
+export const marketTradingStatusSchema = z.enum(["open", "suspended", "closed"]);
+export const marketTypeSchema = z.enum(["YES_NO", "TOTAL_GOALS", "BOTH_TEAMS_TO_SCORE"]);
 
 export const playerMarketTemplateSchema = z.enum(["HAT_TRICK", "YELLOW_CARD"]);
 export const mainCardPlayerMarketTemplateSchema = z.enum(["ANYTIME_GOALSCORER"]);
@@ -31,10 +33,18 @@ export const dataSourceRefSchema = z.object({
   fetchedAt: z.string().datetime().optional()
 });
 
+export const competitionRefSchema = z.object({
+  kind: z.enum(["league", "tournament", "competition"]),
+  id: z.string().min(1).optional(),
+  name: z.string().min(1),
+  season: z.string().min(1).optional()
+});
+
 export const fixtureSchema = z.object({
   id: z.string().min(1),
   sport: sportSchema,
   source: dataSourceRefSchema,
+  competition: competitionRefSchema.optional(),
   homeCompetitor: z.string().min(1),
   awayCompetitor: z.string().min(1),
   homeLogoUrl: z.string().url().optional(),
@@ -69,6 +79,7 @@ export const createYesNoMarketSchema = z.object({
 
 export const generateFixtureMarketsSchema = z.object({
   status: marketStatusSchema.optional(),
+  tradingStatus: marketTradingStatusSchema.optional(),
   totalGoalsLines: z.array(z.enum(["0.5", "1.5", "2.5", "3.5"])).optional()
 });
 
@@ -117,7 +128,7 @@ export const sourceFixtureQuerySchema = z.object({
 
 export const currentFixtureQuerySchema = z.object({
   sport: sportSchema.optional(),
-  days: z.coerce.number().int().min(1).max(14).default(3),
+  days: z.coerce.number().int().min(1).max(90).default(3),
   persist: z.coerce.boolean().default(false),
   createMarkets: z.coerce.boolean().default(false),
   includeInsights: z.coerce.boolean().default(false)
@@ -222,4 +233,30 @@ export const portfolioQuerySchema = z.object({
   marketIds: z.string().min(1).optional().transform((value) =>
     value?.split(",").map((id) => id.trim()).filter(Boolean)
   )
+});
+
+export const marketTradesQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(500).default(100)
+});
+
+export const marketChartQuerySchema = z.object({
+  interval: z.enum(["1m", "5m", "15m", "1h", "1d"]).default("15m"),
+  limit: z.coerce.number().int().min(1).max(1_000).default(500)
+});
+
+export const marketListQuerySchema = z.object({
+  q: z.string().trim().min(1).max(160).optional(),
+  fixtureId: z.string().min(1).optional(),
+  sport: sportSchema.optional(),
+  status: marketStatusSchema.optional(),
+  provider: z.string().trim().min(1).max(80).optional(),
+  fixtureStatus: fixtureStatusSchema.optional(),
+  marketType: marketTypeSchema.optional(),
+  category: z.enum(["match", "player", "main_player", "standalone"]).optional(),
+  competitionId: z.string().trim().min(1).max(120).optional(),
+  competitionName: z.string().trim().min(1).max(160).optional(),
+  sort: z.enum(["kickoff_time", "live_status", "volume", "newest_activity"]).default("kickoff_time"),
+  direction: z.enum(["asc", "desc"]).optional(),
+  offset: z.coerce.number().int().min(0).default(0),
+  limit: z.coerce.number().int().min(1).max(500).default(100)
 });

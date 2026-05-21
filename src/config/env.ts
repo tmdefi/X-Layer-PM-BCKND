@@ -42,7 +42,8 @@ const envSchema = z.object({
   API_FOOTBALL_KEY: z.string().min(1).optional().or(z.literal("")),
   API_FOOTBALL_BASE_URL: z.string().url().default("https://v3.football.api-sports.io"),
   API_FOOTBALL_PLAYER_STATS_SEASON: z.coerce.number().int().positive().optional().or(z.literal("")),
-  API_FOOTBALL_FEATURED_LEAGUE_IDS: z.string().min(1).default("1,2,39,66,88,135,140,848"),
+  API_FOOTBALL_FEATURED_LEAGUE_IDS: z.string().min(1).default("1:2026"),
+  API_FOOTBALL_SYNC_FIXTURE_DAYS: z.coerce.number().int().min(1).max(90).default(30),
   PANDASCORE_TOKEN: z.string().min(1).optional().or(z.literal("")),
   PANDASCORE_BASE_URL: z.string().url().default("https://api.pandascore.co"),
   HIGHLIGHTLY_API_KEY: z.string().min(1).optional().or(z.literal("")),
@@ -57,7 +58,7 @@ const envSchema = z.object({
   SETTLEMENT_SUBMIT_ON_CHAIN: booleanEnvSchema.default(false),
   SYNC_WORKER_ENABLED: booleanEnvSchema.default(true),
   SYNC_POLL_INTERVAL_SECONDS: z.coerce.number().int().min(60).default(300),
-  SYNC_CURRENT_FIXTURE_DAYS: z.coerce.number().int().min(1).max(14).default(3),
+  SYNC_CURRENT_FIXTURE_DAYS: z.coerce.number().int().min(1).max(90).default(3),
   SYNC_CREATE_MARKETS_ON_CHAIN: booleanEnvSchema.default(true),
   SYNC_ON_CHAIN_MARKET_LIMIT: z.coerce.number().int().min(1).max(500).default(50)
 });

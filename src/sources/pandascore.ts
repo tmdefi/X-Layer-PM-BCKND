@@ -30,6 +30,7 @@ type PandaScoreMatch = {
     name?: string | null;
   } | null;
   tournament?: {
+    id?: number | null;
     name?: string | null;
   } | null;
 };
@@ -154,6 +155,18 @@ export class PandaScoreSource implements MarketDataSource {
         sourceUrl: `${this.baseUrl}/matches/${match.id}`,
         fetchedAt: new Date().toISOString()
       },
+      ...(match.tournament?.name ? {
+        competition: {
+          kind: "tournament" as const,
+          ...(match.tournament.id ? { id: String(match.tournament.id) } : {}),
+          name: match.tournament.name
+        }
+      } : match.league?.name ? {
+        competition: {
+          kind: "league" as const,
+          name: match.league.name
+        }
+      } : {}),
       homeCompetitor: homeOpponent.opponent.name,
       awayCompetitor: awayOpponent.opponent.name,
       ...(homeOpponent.opponent.image_url ? { homeLogoUrl: homeOpponent.opponent.image_url } : {}),

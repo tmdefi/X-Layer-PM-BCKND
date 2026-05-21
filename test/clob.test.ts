@@ -10,7 +10,16 @@ import {
   buildSellOrderReadiness,
   type ExchangeOrderReadiness
 } from "../src/chain/exchange.js";
-import { createYesNoMarket } from "../src/markets/definitions.js";
+import {
+  createFootballFixtureMarkets,
+  createMainCardPlayerMarket,
+  createYesNoMarket
+} from "../src/markets/definitions.js";
+import { footballLiveTradingCloseReason } from "../src/markets/live-trading.js";
+import {
+  computeEarlyResolutionDecision,
+  confirmEarlyResolutionDecision
+} from "../src/markets/resolution.js";
 import { SourceRegistry } from "../src/sources/index.js";
 import { buildOrderbook } from "../src/trading/orderbook.js";
 import { manualMatchPlan, planComplementaryMatch, recordMatchResult } from "../src/trading/matcher.js";
@@ -86,7 +95,8 @@ test("signed order submission rejects missing balance or approval before signatu
       validateCalled = true;
       return `0x${"b".repeat(64)}` as Hex;
     },
-    getAccountPortfolioBalances: async () => portfolioBalances()
+    getAccountPortfolioBalances: async () => portfolioBalances(),
+    redemptionTransaction: async () => redeemTransaction()
   });
   const response = await app.inject({
     method: "POST",
@@ -102,6 +112,149 @@ test("signed order submission rejects missing balance or approval before signatu
   assert.equal(response.json().error, "Order maker balance or exchange approval is not ready");
   assert.equal(validateCalled, false);
   await app.close();
+});
+
+test("order readiness rejects a lifecycle-open market when trading is closed", async () => {
+  const store = marketStore();
+  const market = store.getMarket("market-1");
+  assert.ok(market);
+  store.updateMarket({
+    ...market,
+    tradingStatus: "closed",
+    tradingStatusReason: "Live result is known",
+    tradingStatusUpdatedAt: "2026-05-21T00:01:00.000Z"
+  });
+  const app = await testApp(store, {
+    getMarketOnChain: async () => storedMarket(),
+    getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
+    validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
+    getAccountPortfolioBalances: async () => portfolioBalances(),
+    redemptionTransaction: async () => redeemTransaction()
+  });
+  const response = await app.inject({
+    method: "POST",
+    url: "/clob/orders/readiness",
+    payload: {
+      marketId: "market-1",
+      outcomeSide: "YES",
+      maker,
+      side: "BUY",
+      makerAmount: "100"
+    }
+  });
+
+  assert.equal(response.statusCode, 400);
+  assert.equal(response.json().error, "Market trading is closed: Live result is known");
+  await app.close();
+});
+
+test("football live lock rules close determined in-play markets", () => {
+  const fixture = {
+    id: "live-fixture",
+    sport: "football" as const,
+    source: { provider: "api-football", externalFixtureId: "99" },
+    homeCompetitor: "Home FC",
+    awayCompetitor: "Away FC",
+    kickoffTime: "2026-06-11T19:00:00.000Z",
+    status: "live" as const
+  };
+  const markets = createFootballFixtureMarkets(fixture, { status: "open" });
+  const result = {
+    fixtureId: fixture.id,
+    source: fixture.source,
+    status: "live" as const,
+    score: { homeGoals: 1, awayGoals: 1 },
+    halfTimeScore: { homeGoals: 1, awayGoals: 0 },
+    homeTeamScoredFirst: true,
+    observedAt: "2026-06-11T20:00:00.000Z"
+  };
+
+  assert.equal(
+    footballLiveTradingCloseReason(markets.find((market) => market.id.endsWith(":first-half-draw"))!, result),
+    "First-half result is known"
+  );
+  assert.equal(
+    footballLiveTradingCloseReason(markets.find((market) => market.id.endsWith(":home-team-score-first"))!, result),
+    "First goal is known"
+  );
+  assert.equal(
+    footballLiveTradingCloseReason(markets.find((market) => market.type === "BOTH_TEAMS_TO_SCORE")!, result),
+    "Both teams have scored"
+  );
+  assert.equal(
+    footballLiveTradingCloseReason(markets.find((market) => market.type === "TOTAL_GOALS" && market.line === "1.5")!, result),
+    "Total goals already exceed line 1.5"
+  );
+  assert.equal(
+    footballLiveTradingCloseReason(markets.find((market) => market.id.endsWith(":home-team-win"))!, result),
+    undefined
+  );
+  assert.equal(
+    computeEarlyResolutionDecision(markets.find((market) => market.id.endsWith(":home-team-score-first"))!, result)?.outcome,
+    "YES"
+  );
+  assert.equal(
+    computeEarlyResolutionDecision(markets.find((market) => market.type === "TOTAL_GOALS" && market.line === "1.5")!, result)?.outcome,
+    "OVER"
+  );
+  assert.equal(
+    computeEarlyResolutionDecision(markets.find((market) => market.type === "BOTH_TEAMS_TO_SCORE")!, result)?.outcome,
+    "YES"
+  );
+  const overMarket = markets.find((market) => market.type === "TOTAL_GOALS" && market.line === "1.5")!;
+  const firstOverObservation = computeEarlyResolutionDecision(overMarket, result);
+  assert.equal(firstOverObservation?.earlyResolution?.policy, "REPEATED_SCORE");
+  assert.equal(firstOverObservation?.earlyResolution?.observationCount, 1);
+  assert.equal(firstOverObservation?.earlyResolution?.confirmedAt, undefined);
+  const confirmedOver = confirmEarlyResolutionDecision(
+    firstOverObservation,
+    computeEarlyResolutionDecision(overMarket, {
+      ...result,
+      score: { homeGoals: 2, awayGoals: 1 },
+      observedAt: "2026-06-11T20:01:00.000Z"
+    })!
+  );
+  assert.equal(confirmedOver.earlyResolution?.observationCount, 2);
+  assert.ok(confirmedOver.earlyResolution?.confirmedAt);
+
+  const playerMarket = createMainCardPlayerMarket({
+    fixture,
+    playerId: "7",
+    playerName: "Scorer One",
+    teamSide: "home",
+    template: "ANYTIME_GOALSCORER",
+    status: "open"
+  });
+  assert.equal(
+    computeEarlyResolutionDecision(playerMarket, {
+      ...result,
+      scoringPlayers: [{
+        provider: "api-football",
+        playerId: "7",
+        playerName: "Scorer One",
+        teamSide: "home"
+      }]
+    })?.outcome,
+    "YES"
+  );
+  assert.equal(
+    computeEarlyResolutionDecision(playerMarket, {
+      ...result,
+      scoringPlayerNames: ["Scorer One"]
+    }),
+    undefined
+  );
+  assert.equal(
+    computeEarlyResolutionDecision(playerMarket, {
+      ...result,
+      scoringPlayers: [{
+        provider: "api-football",
+        playerName: "Scorer One",
+        teamSide: "home"
+      }]
+    }),
+    undefined
+  );
 });
 
 test("orderbook aggregates open levels and excludes filled orders", () => {
@@ -198,7 +351,8 @@ test("matcher and operator endpoints are protected", async () => {
     getMarketOnChain: async () => storedMarket(),
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
-    getAccountPortfolioBalances: async () => portfolioBalances()
+    getAccountPortfolioBalances: async () => portfolioBalances(),
+    redemptionTransaction: async () => redeemTransaction()
   });
 
   const match = await app.inject({ method: "POST", url: "/clob/matches", payload: {} });
@@ -247,7 +401,8 @@ test("portfolio summarizes orders, fills, balances, and redeemable submitted pos
     getMarketOnChain: async () => storedMarket(),
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
-    getAccountPortfolioBalances: async () => portfolioBalances()
+    getAccountPortfolioBalances: async () => portfolioBalances(),
+    redemptionTransaction: async () => redeemTransaction()
   });
   const response = await app.inject({
     method: "GET",
@@ -262,6 +417,236 @@ test("portfolio summarizes orders, fills, balances, and redeemable submitted pos
   assert.equal(body.fills.length, 1);
   assert.equal(body.positions[0].outcomes[1].balance, "80");
   assert.equal(body.positions[0].outcomes[1].redeemable, true);
+  const redemption = await app.inject({
+    method: "POST",
+    url: "/markets/market-1/redeem-transaction"
+  });
+  assert.equal(redemption.statusCode, 200);
+  assert.equal(redemption.json().transaction.to, ctf);
+  await app.close();
+});
+
+test("market event hub emits trading, early resolution, and redeemable transitions", () => {
+  const store = marketStore();
+  const events: string[] = [];
+  const unsubscribe = store.marketEvents.subscribe((event) => {
+    events.push(event.type);
+  });
+  const market = store.getMarket("market-1");
+  assert.ok(market);
+
+  store.updateMarket({
+    ...market,
+    tradingStatus: "closed",
+    tradingStatusReason: "Live result is known",
+    tradingStatusUpdatedAt: "2026-05-21T00:01:00.000Z"
+  });
+  const earlyResolution = {
+    marketId: "market-1",
+    marketType: "YES_NO" as const,
+    outcome: "YES" as const,
+    payoutVector: [0, 1] as const,
+    status: "computed" as const,
+    source: { provider: "api-football" },
+    observedAt: "2026-05-21T00:01:00.000Z",
+    computedAt: "2026-05-21T00:01:01.000Z",
+    reason: "Confirmed live scorer",
+    earlyResolution: {
+      policy: "STABLE_PLAYER_SCORER" as const,
+      evidenceKey: "market-1:api-football:7",
+      observationCount: 1,
+      firstObservedAt: "2026-05-21T00:01:00.000Z",
+      lastObservedAt: "2026-05-21T00:01:00.000Z"
+    }
+  };
+  store.upsertResolution(earlyResolution);
+  store.upsertResolution({
+    ...earlyResolution,
+    status: "submitted",
+    earlyResolution: {
+      ...earlyResolution.earlyResolution,
+      observationCount: 2,
+      lastObservedAt: "2026-05-21T00:02:00.000Z",
+      confirmedAt: "2026-05-21T00:02:01.000Z"
+    }
+  });
+  unsubscribe();
+
+  assert.deepEqual(events, [
+    "market.trading_status_changed",
+    "market.early_resolution_candidate",
+    "market.resolution_submitted",
+    "market.redeemable"
+  ]);
+});
+
+test("market data routes expose frontend prices, ticks, summaries, and candles", async () => {
+  const store = marketStore();
+  const taker = storedOrder({ id: "buy", side: "BUY", makerAmount: "60", takerAmount: "100", remainingMaker: "60" });
+  const makerSell = storedOrder({
+    id: "sell",
+    side: "SELL",
+    makerAmount: "40",
+    takerAmount: "24",
+    remainingMaker: "40",
+    maker: makerTwo
+  });
+  store.upsertClobOrder(taker);
+  store.upsertClobOrder(makerSell);
+  recordMatchResult(store, manualMatchPlan({
+    takerOrder: taker,
+    makerOrders: [makerSell],
+    takerFillAmount: "24",
+    makerFillAmounts: ["40"]
+  }), transactionHash);
+
+  const app = await testApp(store, {
+    getMarketOnChain: async () => storedMarket(),
+    getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
+    validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
+    getAccountPortfolioBalances: async () => portfolioBalances(),
+    redemptionTransaction: async () => redeemTransaction()
+  });
+  const [price, trades, chart, summary] = await Promise.all([
+    app.inject({ method: "GET", url: "/markets/market-1/price" }),
+    app.inject({ method: "GET", url: "/markets/market-1/trades?limit=1" }),
+    app.inject({ method: "GET", url: "/markets/market-1/chart?interval=1h" }),
+    app.inject({ method: "GET", url: "/markets/market-1/summary" })
+  ]);
+
+  assert.equal(price.statusCode, 200);
+  assert.equal(price.json().prices.YES.lastTradePrice, "0.6");
+  assert.equal(price.json().prices.YES.volume, "24");
+  assert.equal(trades.json().ticks[0].shareAmount, "40");
+  assert.equal(trades.json().ticks[0].collateralAmount, "24");
+  assert.equal(chart.json().interval, "1h");
+  assert.equal(chart.json().candles.YES[0].close, "0.6");
+  assert.equal(chart.json().candles.YES[0].tradeCount, 1);
+  assert.equal(summary.json().summary.openOrderCount, 1);
+  assert.equal(summary.json().summary.shareVolume, "40");
+  await app.close();
+});
+
+test("market summary list and card feed batch frontend snippets", async () => {
+  const store = marketStore();
+  store.upsertFixture({
+    id: "fixture-1",
+    sport: "football",
+    source: { provider: "test", externalFixtureId: "fixture-1" },
+    competition: { kind: "league", id: "premier-league", name: "Premier League", season: "2026" },
+    homeCompetitor: "Home FC",
+    awayCompetitor: "Away FC",
+    kickoffTime: "2026-05-22T18:00:00.000Z",
+    status: "scheduled"
+  });
+  store.upsertMarket(createYesNoMarket({
+    id: "fixture-market",
+    fixtureId: "fixture-1",
+    title: "Home FC to win",
+    status: "open"
+  }));
+  store.upsertMarket(createYesNoMarket({
+    id: "player-market",
+    fixtureId: "fixture-1",
+    title: "Striker One to score a hat trick",
+    status: "open",
+    template: {
+      category: "PLAYER",
+      template: "HAT_TRICK",
+      player: {
+        provider: "test",
+        playerId: "striker-one",
+        playerName: "Striker One",
+        teamSide: "home"
+      }
+    }
+  }));
+  store.upsertFixture({
+    id: "fixture-2",
+    sport: "football",
+    source: { provider: "test", externalFixtureId: "fixture-2" },
+    competition: { kind: "league", id: "champions-league", name: "Champions League", season: "2026" },
+    homeCompetitor: "Live FC",
+    awayCompetitor: "Away Town",
+    kickoffTime: "2026-05-23T18:00:00.000Z",
+    status: "live"
+  });
+  store.upsertMarket(createYesNoMarket({
+    id: "live-market",
+    fixtureId: "fixture-2",
+    title: "Live FC to win",
+    status: "open"
+  }));
+  const liveBuy = storedOrder({
+    id: "live-buy",
+    marketId: "live-market",
+    side: "BUY",
+    makerAmount: "36",
+    takerAmount: "60",
+    remainingMaker: "36"
+  });
+  const liveSell = storedOrder({
+    id: "live-sell",
+    marketId: "live-market",
+    side: "SELL",
+    makerAmount: "60",
+    takerAmount: "36",
+    remainingMaker: "60",
+    maker: makerTwo
+  });
+  store.upsertClobOrder(liveBuy);
+  store.upsertClobOrder(liveSell);
+  recordMatchResult(store, manualMatchPlan({
+    takerOrder: liveBuy,
+    makerOrders: [liveSell],
+    takerFillAmount: "36",
+    makerFillAmounts: ["60"]
+  }), transactionHash);
+
+  const app = await testApp(store, {
+    getMarketOnChain: async () => storedMarket(),
+    getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
+    validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
+    getAccountPortfolioBalances: async () => portfolioBalances(),
+    redemptionTransaction: async () => redeemTransaction()
+  });
+  const [summaries, cards, kickoffPage, volume, activity, search, playerCards, standalone, competition] = await Promise.all([
+    app.inject({ method: "GET", url: "/markets/summaries?status=open&limit=10" }),
+    app.inject({ method: "GET", url: "/markets/cards?sort=live_status" }),
+    app.inject({ method: "GET", url: "/markets/cards?sort=kickoff_time&offset=2&limit=1" }),
+    app.inject({ method: "GET", url: "/markets/summaries?sort=volume&limit=1" }),
+    app.inject({ method: "GET", url: "/markets/summaries?sort=newest_activity&limit=1" }),
+    app.inject({ method: "GET", url: "/markets/summaries?q=Away%20Town&provider=test&fixtureStatus=live" }),
+    app.inject({ method: "GET", url: "/markets/cards?category=player" }),
+    app.inject({ method: "GET", url: "/markets/summaries?category=standalone&marketType=YES_NO" }),
+    app.inject({ method: "GET", url: "/markets/cards?competitionId=premier-league&competitionName=premier" })
+  ]);
+
+  assert.equal(summaries.statusCode, 200);
+  assert.equal(summaries.json().summaries.length, 4);
+  assert.equal(summaries.json().summaries[0].summary.openOrderCount, 0);
+  assert.equal(cards.statusCode, 200);
+  assert.equal(cards.json().cards.length, 4);
+  assert.equal(cards.json().cards[0].type, "MATCH");
+  assert.equal(cards.json().cards[0].fixture.id, "fixture-2");
+  assert.equal(cards.json().cards[1].fixture.id, "fixture-1");
+  assert.equal(cards.json().cards[2].type, "PLAYER");
+  assert.equal(cards.json().cards[3].type, "MARKET");
+  assert.equal(kickoffPage.json().cards[0].fixture.id, "fixture-2");
+  assert.equal(kickoffPage.json().pagination.total, 4);
+  assert.equal(kickoffPage.json().pagination.hasMore, true);
+  assert.equal(kickoffPage.json().pagination.nextOffset, 3);
+  assert.equal(volume.json().summaries[0].market.id, "live-market");
+  assert.equal(activity.json().summaries[0].market.id, "live-market");
+  assert.equal(search.json().summaries.length, 1);
+  assert.equal(search.json().summaries[0].market.id, "live-market");
+  assert.equal(playerCards.json().cards.length, 1);
+  assert.equal(playerCards.json().cards[0].type, "PLAYER");
+  assert.equal(playerCards.json().cards[0].summaries[0].market.id, "player-market");
+  assert.equal(standalone.json().summaries.length, 1);
+  assert.equal(standalone.json().summaries[0].market.id, "market-1");
+  assert.equal(competition.json().cards.length, 2);
+  assert.equal(competition.json().cards[0].fixture.competition.name, "Premier League");
   await app.close();
 });
 
@@ -304,6 +689,13 @@ function portfolioBalances() {
   };
 }
 
+function redeemTransaction() {
+  return {
+    to: ctf,
+    data: `0x${"f".repeat(64)}` as Hex
+  };
+}
+
 function unreadyBuyReadiness(): ExchangeOrderReadiness {
   return buildBuyOrderReadiness({
     marketId: "market-1",
@@ -320,6 +712,7 @@ function unreadyBuyReadiness(): ExchangeOrderReadiness {
 
 function storedOrder(input: {
   id: string;
+  marketId?: string | undefined;
   side: "BUY" | "SELL";
   makerAmount: string;
   takerAmount: string;
@@ -331,7 +724,7 @@ function storedOrder(input: {
   const createdAt = input.createdAt ?? "2026-05-21T00:00:00.000Z";
   return {
     id: input.id,
-    marketId: "market-1",
+    marketId: input.marketId ?? "market-1",
     outcomeSide: "YES",
     orderHash: (`0x${input.id.padEnd(64, "0").slice(0, 64)}`) as Hex,
     side: input.side,

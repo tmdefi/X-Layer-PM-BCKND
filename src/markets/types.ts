@@ -3,6 +3,7 @@ export type MarketType = "YES_NO" | "TOTAL_GOALS" | "BOTH_TEAMS_TO_SCORE";
 export type Sport = "football" | "basketball" | "american_football" | "esports";
 
 export type MarketStatus = "draft" | "open" | "closed" | "resolved" | "cancelled";
+export type MarketTradingStatus = "open" | "suspended" | "closed";
 
 export type FixtureStatus = "scheduled" | "live" | "finished" | "postponed" | "cancelled" | "abandoned";
 
@@ -19,12 +20,20 @@ export type Fixture = {
   id: string;
   sport: Sport;
   source: DataSourceRef;
+  competition?: CompetitionRef | undefined;
   homeCompetitor: string;
   awayCompetitor: string;
   homeLogoUrl?: string | undefined;
   awayLogoUrl?: string | undefined;
   kickoffTime: string;
   status: FixtureStatus;
+};
+
+export type CompetitionRef = {
+  kind: "league" | "tournament" | "competition";
+  id?: string | undefined;
+  name: string;
+  season?: string | undefined;
 };
 
 export type FootballFixture = Fixture & {
@@ -71,6 +80,9 @@ export type BaseMarketDefinition = {
   type: MarketType;
   title: string;
   status: MarketStatus;
+  tradingStatus: MarketTradingStatus;
+  tradingStatusReason?: string | undefined;
+  tradingStatusUpdatedAt?: string | undefined;
   source?: DataSourceRef | undefined;
   resolver?: ResolverConfig | undefined;
   outcomes: readonly [OutcomeDefinition, OutcomeDefinition];
@@ -158,6 +170,20 @@ export type ProviderFixtureResult = {
 
 export type ResolutionStatus = "computed" | "reviewed" | "submitted" | "rejected";
 
+export type EarlyResolutionPolicy =
+  | "REPEATED_SCORE"
+  | "STABLE_FIRST_GOAL"
+  | "STABLE_PLAYER_SCORER";
+
+export type EarlyResolutionConfirmation = {
+  policy: EarlyResolutionPolicy;
+  evidenceKey: string;
+  observationCount: number;
+  firstObservedAt: string;
+  lastObservedAt: string;
+  confirmedAt?: string | undefined;
+};
+
 export type ResolutionDecision = {
   marketId: string;
   marketType: MarketType;
@@ -168,4 +194,5 @@ export type ResolutionDecision = {
   observedAt: string;
   computedAt: string;
   reason: string;
+  earlyResolution?: EarlyResolutionConfirmation | undefined;
 };

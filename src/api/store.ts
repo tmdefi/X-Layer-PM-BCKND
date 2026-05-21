@@ -5,6 +5,7 @@ import { env } from "../config/env.js";
 import type { Fixture, MarketDefinition, ResolutionDecision } from "../markets/types.js";
 import type { FixtureInsights } from "../sources/types.js";
 import type { StoredClobFill, StoredClobOrder, StoredClobTrade } from "../trading/types.js";
+import { MarketEventHub, type MarketRealtimeEventInput } from "./market-events.js";
 
 export type FixtureInsightsCacheEntry = {
   insights: FixtureInsights;
@@ -27,6 +28,7 @@ export type ProviderSyncLogInput = Omit<ProviderSyncLog, "id"> & {
 };
 
 export class InMemoryStore {
+  readonly marketEvents = new MarketEventHub();
   readonly fixtures = new Map<string, Fixture>();
   readonly markets = new Map<string, MarketDefinition>();
   readonly resolutions = new Map<string, ResolutionDecision>();
@@ -37,13 +39,29 @@ export class InMemoryStore {
   readonly clobTrades = new Map<string, StoredClobTrade>();
 
   upsertFixture(fixture: Fixture): Fixture {
+    const current = this.fixtures.get(fixture.id);
     this.fixtures.set(fixture.id, fixture);
+    if (current && current.status !== fixture.status) {
+      this.marketEvents.publish({
+        type: "fixture.status_changed",
+        fixtureId: fixture.id,
+        fixture
+      });
+    }
     return fixture;
   }
 
   upsertFixtures(fixtures: Fixture[]): Fixture[] {
     for (const fixture of fixtures) {
+      const current = this.fixtures.get(fixture.id);
       this.fixtures.set(fixture.id, fixture);
+      if (current && current.status !== fixture.status) {
+        this.marketEvents.publish({
+          type: "fixture.status_changed",
+          fixtureId: fixture.id,
+          fixture
+        });
+      }
     }
 
     return fixtures;
@@ -58,13 +76,29 @@ export class InMemoryStore {
   }
 
   upsertMarket(market: MarketDefinition): MarketDefinition {
+    const current = this.markets.get(market.id);
     this.markets.set(market.id, market);
+    if (!current) {
+      this.marketEvents.publish({
+        type: "market.created",
+        market
+      });
+    }
+    this.publishTradingStatusChange(current, market);
     return market;
   }
 
   upsertMarkets(markets: MarketDefinition[]): MarketDefinition[] {
     for (const market of markets) {
+      const current = this.markets.get(market.id);
       this.markets.set(market.id, market);
+      if (!current) {
+        this.marketEvents.publish({
+          type: "market.created",
+          market
+        });
+      }
+      this.publishTradingStatusChange(current, market);
     }
 
     return markets;
@@ -79,12 +113,38 @@ export class InMemoryStore {
   }
 
   updateMarket(market: MarketDefinition): MarketDefinition {
-    this.markets.set(market.id, market);
-    return market;
+    return this.upsertMarket(market);
   }
 
   upsertResolution(decision: ResolutionDecision): ResolutionDecision {
+    const current = this.resolutions.get(decision.marketId);
     this.resolutions.set(decision.marketId, decision);
+    if (
+      decision.earlyResolution &&
+      !decision.earlyResolution.confirmedAt &&
+      earlyResolutionEventKey(current) !== earlyResolutionEventKey(decision)
+    ) {
+      this.marketEvents.publish({
+        type: "market.early_resolution_candidate",
+        marketId: decision.marketId,
+        resolution: decision
+      });
+    }
+    if (decision.status === "submitted" && current?.status !== "submitted") {
+      this.marketEvents.publish({
+        type: "market.resolution_submitted",
+        marketId: decision.marketId,
+        resolution: decision
+      });
+      if (decision.outcome !== "VOID") {
+        this.marketEvents.publish({
+          type: "market.redeemable",
+          marketId: decision.marketId,
+          winningOutcome: decision.outcome,
+          resolution: decision
+        });
+      }
+    }
     return decision;
   }
 
@@ -94,6 +154,10 @@ export class InMemoryStore {
 
   listResolutions(): ResolutionDecision[] {
     return [...this.resolutions.values()];
+  }
+
+  publishMarketEvent(input: MarketRealtimeEventInput) {
+    return this.marketEvents.publish(input);
   }
 
   getFixtureInsights(cacheKey: string, now = new Date()): FixtureInsightsCacheEntry | undefined {
@@ -178,6 +242,27 @@ export class InMemoryStore {
   }
 
   async waitForPendingWrites(): Promise<void> {}
+
+  private publishTradingStatusChange(
+    current: MarketDefinition | undefined,
+    market: MarketDefinition
+  ): void {
+    if (!current || current.tradingStatus === market.tradingStatus) return;
+
+    this.marketEvents.publish({
+      type: "market.trading_status_changed",
+      marketId: market.id,
+      status: market.status,
+      tradingStatus: market.tradingStatus,
+      ...(market.tradingStatusReason ? { reason: market.tradingStatusReason } : {})
+    });
+  }
+}
+
+function earlyResolutionEventKey(decision: ResolutionDecision | undefined): string | undefined {
+  const confirmation = decision?.earlyResolution;
+  if (!confirmation || confirmation.confirmedAt) return undefined;
+  return `${confirmation.evidenceKey}:${confirmation.observationCount}:${confirmation.lastObservedAt}`;
 }
 
 export class PrismaBackedStore extends InMemoryStore {
@@ -205,6 +290,7 @@ export class PrismaBackedStore extends InMemoryStore {
         id: fixture.id,
         sport: fixture.sport as Fixture["sport"],
         source: fixture.source as Fixture["source"],
+        ...(fixture.competition ? { competition: fixture.competition as Fixture["competition"] } : {}),
         homeCompetitor: fixture.homeCompetitor,
         awayCompetitor: fixture.awayCompetitor,
         ...(fixture.homeLogoUrl ? { homeLogoUrl: fixture.homeLogoUrl } : {}),
@@ -221,6 +307,9 @@ export class PrismaBackedStore extends InMemoryStore {
         type: market.type as MarketDefinition["type"],
         title: market.title,
         status: market.status as MarketDefinition["status"],
+        tradingStatus: market.tradingStatus as MarketDefinition["tradingStatus"],
+        ...(market.tradingStatusReason ? { tradingStatusReason: market.tradingStatusReason } : {}),
+        ...(market.tradingStatusUpdatedAt ? { tradingStatusUpdatedAt: market.tradingStatusUpdatedAt.toISOString() } : {}),
         ...(market.source ? { source: market.source as MarketDefinition["source"] } : {}),
         ...(market.resolver ? { resolver: market.resolver as MarketDefinition["resolver"] } : {}),
         outcomes: market.outcomes as unknown as MarketDefinition["outcomes"],
@@ -241,7 +330,10 @@ export class PrismaBackedStore extends InMemoryStore {
         source: resolution.source as ResolutionDecision["source"],
         observedAt: resolution.observedAt.toISOString(),
         computedAt: resolution.computedAt.toISOString(),
-        reason: resolution.reason
+        reason: resolution.reason,
+        ...(resolution.earlyResolution
+          ? { earlyResolution: resolution.earlyResolution as ResolutionDecision["earlyResolution"] }
+          : {})
       });
     }
 
@@ -308,6 +400,7 @@ export class PrismaBackedStore extends InMemoryStore {
         id: fixture.id,
         sport: fixture.sport,
         source: toJsonValue(fixture.source),
+        competition: fixture.competition ? toJsonValue(fixture.competition) : Prisma.DbNull,
         homeCompetitor: fixture.homeCompetitor,
         awayCompetitor: fixture.awayCompetitor,
         homeLogoUrl: fixture.homeLogoUrl ?? null,
@@ -318,6 +411,7 @@ export class PrismaBackedStore extends InMemoryStore {
       update: {
         sport: fixture.sport,
         source: toJsonValue(fixture.source),
+        competition: fixture.competition ? toJsonValue(fixture.competition) : Prisma.DbNull,
         homeCompetitor: fixture.homeCompetitor,
         awayCompetitor: fixture.awayCompetitor,
         homeLogoUrl: fixture.homeLogoUrl ?? null,
@@ -332,14 +426,14 @@ export class PrismaBackedStore extends InMemoryStore {
 
   override upsertFixtures(fixtures: Fixture[]): Fixture[] {
     const stored = super.upsertFixtures(fixtures);
-    this.persist(this.prisma.$transaction(
-      fixtures.map((fixture) =>
+    this.persist(persistBatches(batches(fixtures, 25), (batch) =>
+      Promise.all(batch.map((fixture) =>
         this.prisma.fixture.upsert({
           where: { id: fixture.id },
           create: fixtureToPrismaCreate(fixture),
           update: fixtureToPrismaUpdate(fixture)
         })
-      )
+      ))
     ));
 
     return stored;
@@ -358,14 +452,14 @@ export class PrismaBackedStore extends InMemoryStore {
 
   override upsertMarkets(markets: MarketDefinition[]): MarketDefinition[] {
     const stored = super.upsertMarkets(markets);
-    this.persist(this.prisma.$transaction(
-      markets.map((market) =>
+    this.persist(persistBatches(batches(markets, 10), (batch) =>
+      Promise.all(batch.map((market) =>
         this.prisma.market.upsert({
           where: { id: market.id },
           create: marketToPrismaCreate(market),
           update: marketToPrismaUpdate(market)
         })
-      )
+      ))
     ));
 
     return stored;
@@ -388,7 +482,8 @@ export class PrismaBackedStore extends InMemoryStore {
         source: toJsonValue(decision.source),
         observedAt: new Date(decision.observedAt),
         computedAt: new Date(decision.computedAt),
-        reason: decision.reason
+        reason: decision.reason,
+        ...(decision.earlyResolution ? { earlyResolution: toJsonValue(decision.earlyResolution) } : {})
       },
       update: {
         marketType: decision.marketType,
@@ -398,7 +493,10 @@ export class PrismaBackedStore extends InMemoryStore {
         source: toJsonValue(decision.source),
         observedAt: new Date(decision.observedAt),
         computedAt: new Date(decision.computedAt),
-        reason: decision.reason
+        reason: decision.reason,
+        earlyResolution: decision.earlyResolution
+          ? toJsonValue(decision.earlyResolution)
+          : Prisma.DbNull
       }
     }));
 
@@ -561,6 +659,9 @@ function marketToPrismaCreate(market: MarketDefinition): Prisma.MarketCreateInpu
     type: market.type,
     title: market.title,
     status: market.status,
+    tradingStatus: market.tradingStatus,
+    ...(market.tradingStatusReason ? { tradingStatusReason: market.tradingStatusReason } : {}),
+    ...(market.tradingStatusUpdatedAt ? { tradingStatusUpdatedAt: new Date(market.tradingStatusUpdatedAt) } : {}),
     ...(market.fixtureId ? { fixture: { connect: { id: market.fixtureId } } } : {}),
     ...(market.source ? { source: toJsonValue(market.source) } : {}),
     ...(market.resolver ? { resolver: toJsonValue(market.resolver) } : {}),
@@ -576,6 +677,7 @@ function fixtureToPrismaCreate(fixture: Fixture): Prisma.FixtureCreateInput {
     id: fixture.id,
     sport: fixture.sport,
     source: toJsonValue(fixture.source),
+    ...(fixture.competition ? { competition: toJsonValue(fixture.competition) } : {}),
     homeCompetitor: fixture.homeCompetitor,
     awayCompetitor: fixture.awayCompetitor,
     homeLogoUrl: fixture.homeLogoUrl ?? null,
@@ -589,6 +691,7 @@ function fixtureToPrismaUpdate(fixture: Fixture): Prisma.FixtureUpdateInput {
   return {
     sport: fixture.sport,
     source: toJsonValue(fixture.source),
+    competition: fixture.competition ? toJsonValue(fixture.competition) : Prisma.DbNull,
     homeCompetitor: fixture.homeCompetitor,
     awayCompetitor: fixture.awayCompetitor,
     homeLogoUrl: fixture.homeLogoUrl ?? null,
@@ -603,6 +706,9 @@ function marketToPrismaUpdate(market: MarketDefinition): Prisma.MarketUpdateInpu
     type: market.type,
     title: market.title,
     status: market.status,
+    tradingStatus: market.tradingStatus,
+    tradingStatusReason: market.tradingStatusReason ?? null,
+    tradingStatusUpdatedAt: market.tradingStatusUpdatedAt ? new Date(market.tradingStatusUpdatedAt) : null,
     ...(market.fixtureId ? { fixture: { connect: { id: market.fixtureId } } } : { fixture: { disconnect: true } }),
     source: market.source ? toJsonValue(market.source) : Prisma.DbNull,
     resolver: market.resolver ? toJsonValue(market.resolver) : Prisma.DbNull,
@@ -622,6 +728,23 @@ function marketShapeFields(market: MarketDefinition): { sport?: string; line?: s
 
 function toJsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function batches<T>(values: T[], size: number): T[][] {
+  const result: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    result.push(values.slice(index, index + size));
+  }
+  return result;
+}
+
+async function persistBatches<T>(
+  values: T[][],
+  persist: (batch: T[]) => Promise<unknown>
+): Promise<void> {
+  for (const batch of values) {
+    await persist(batch);
+  }
 }
 
 function clobOrderFromPrisma(order: {

@@ -168,6 +168,7 @@ export class ProviderSyncWorker {
       const existingMarketIds = new Set(this.options.store.listMarkets().map((market) => market.id));
 
       this.options.store.upsertFixtures(fixtures);
+      await this.options.store.waitForPendingWrites();
       this.options.store.upsertMarkets(markets);
       await this.options.store.waitForPendingWrites();
       const onChain = await this.createMarketsOnChain(markets);
@@ -221,17 +222,20 @@ export class ProviderSyncWorker {
   }
 
   private async currentFixtures(provider: string): Promise<{ fixtures: Fixture[]; errors: string[] }> {
-    const source = this.options.sourceRegistry.get(provider);
     const sport = defaultSportForProvider(provider);
+    const dates = currentDateWindow(syncDaysForProvider(provider, this.days));
+    const dateQueries = rangeFixtureProvider(provider)
+      ? [{ from: dates[0]!, to: dates[dates.length - 1]! }]
+      : dates.map((date) => ({ from: date }));
     const results = await Promise.all(
-      currentDateWindow(this.days).map(async (date) => {
-        const query: FixtureQuery = { from: date };
+      dateQueries.map(async (dateQuery) => {
+        const query: FixtureQuery = { ...dateQuery };
         if (sport) query.sport = sport;
         try {
           const fixtures = await this.listFixturesForSync(provider, query);
           return { fixtures, errors: [] as string[] };
         } catch (error) {
-          return { fixtures: [] as Fixture[], errors: [`${date}: ${errorMessage(error)}`] };
+          return { fixtures: [] as Fixture[], errors: [`${dateQuery.from}: ${errorMessage(error)}`] };
         }
       })
     );
@@ -249,10 +253,13 @@ export class ProviderSyncWorker {
     const leagueRefs = featuredLeagueRefsForProvider(provider);
     if (leagueRefs.length === 0) return source.listFixtures(query);
 
-    return source.listFixtures({
-      ...query,
-      allowedLeagueIds: leagueRefs.map((leagueRef) => leagueRef.leagueId)
-    });
+    return uniqueFixtures((await Promise.all(leagueRefs.map((leagueRef) =>
+      source.listFixtures({
+        ...query,
+        leagueId: leagueRef.leagueId,
+        ...(leagueRef.season ? { season: leagueRef.season } : {})
+      })
+    ))).flat());
   }
 
   private async createMarketsOnChain(markets: MarketDefinition[]): Promise<{
@@ -330,7 +337,10 @@ function preserveTerminalMarketStatus(next: MarketDefinition, current: MarketDef
   if (!current) return next;
   const nextWithChainState = {
     ...next,
-    ...(current.conditionId ? { conditionId: current.conditionId } : {})
+    ...(current.conditionId ? { conditionId: current.conditionId } : {}),
+    tradingStatus: current.tradingStatus,
+    ...(current.tradingStatusReason ? { tradingStatusReason: current.tradingStatusReason } : {}),
+    ...(current.tradingStatusUpdatedAt ? { tradingStatusUpdatedAt: current.tradingStatusUpdatedAt } : {})
   } as MarketDefinition;
 
   if (current.status === "closed" || current.status === "resolved" || current.status === "cancelled") {
@@ -350,15 +360,24 @@ function defaultSportForProvider(provider: string): Sport | undefined {
   return undefined;
 }
 
-function featuredLeagueRefsForProvider(provider: string): { leagueId: string }[] {
+function rangeFixtureProvider(provider: string): boolean {
+  return provider === "api-football" || provider === "pandascore";
+}
+
+function syncDaysForProvider(provider: string, defaultDays: number): number {
+  return provider === "api-football" ? env.API_FOOTBALL_SYNC_FIXTURE_DAYS : defaultDays;
+}
+
+function featuredLeagueRefsForProvider(provider: string): { leagueId: string; season?: string | undefined }[] {
   if (provider !== "api-football") return [];
   return env.API_FOOTBALL_FEATURED_LEAGUE_IDS.split(",")
     .map((raw) => raw.trim())
     .filter(Boolean)
     .map((raw) => {
-      const [leagueId] = raw.split(":");
+      const [leagueId, season] = raw.split(":");
       return {
-        leagueId: leagueId?.trim() ?? ""
+        leagueId: leagueId?.trim() ?? "",
+        ...(season?.trim() ? { season: season.trim() } : {})
       };
     })
     .filter((ref) => Boolean(ref.leagueId));

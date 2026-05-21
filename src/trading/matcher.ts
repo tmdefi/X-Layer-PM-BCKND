@@ -77,6 +77,10 @@ export async function autoMatchOrder(store: InMemoryStore, takerOrder: StoredClo
   if (!env.CLOB_AUTO_MATCH_ENABLED) {
     return { attempted: false, matched: false, reason: "Automatic CLOB matching is disabled" };
   }
+  const market = store.getMarket(takerOrder.marketId);
+  if (!market || market.status !== "open" || market.tradingStatus !== "open") {
+    return { attempted: false, matched: false, reason: "Market is not open for trading" };
+  }
 
   const plan = planComplementaryMatch(takerOrder, store.listClobOrders(takerOrder.marketId));
   if (!plan) return { attempted: true, matched: false, reason: "No crossing BUY/SELL orders found" };

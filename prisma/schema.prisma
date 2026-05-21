@@ -10,6 +10,7 @@ model Fixture {
   id             String   @id
   sport          String
   source         Json
+  competition    Json?
   homeCompetitor String
   awayCompetitor String
   homeLogoUrl    String?
@@ -31,6 +32,9 @@ model Market {
   type        String
   title       String
   status      String
+  tradingStatus String @default("closed")
+  tradingStatusReason String?
+  tradingStatusUpdatedAt DateTime?
   source      Json?
   resolver    Json?
   outcomes    Json
@@ -48,6 +52,7 @@ model Market {
 
   @@index([fixtureId])
   @@index([status])
+  @@index([tradingStatus])
   @@index([type])
 }
 
@@ -139,6 +144,7 @@ model Resolution {
   observedAt   DateTime
   computedAt   DateTime
   reason       String
+  earlyResolution Json?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

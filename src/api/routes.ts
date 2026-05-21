@@ -13,6 +13,7 @@ import {
   incrementNonceTransaction,
   outcomeSideToResolverOutcome,
   prepareExchangeOrder,
+  redemptionTransaction,
   resolveMarketOnChain,
   validateExchangeOrder
 } from "../chain/index.js";
@@ -44,9 +45,12 @@ import {
   autoMatchOrder,
   buildOrderbook,
   executeMatchPlan,
+  marketCandles,
+  marketPriceData,
+  marketSummaryData,
+  marketTradeTicks,
   manualMatchPlan,
   matchRequestError,
-  orderPrice,
   enrichPortfolioPosition,
   portfolioActivity,
   portfolioMarketCandidates,
@@ -65,6 +69,9 @@ import {
   fixtureSchema,
   generateFixtureMarketsSchema,
   matchClobOrdersSchema,
+  marketChartQuerySchema,
+  marketListQuerySchema,
+  marketTradesQuerySchema,
   prepareClobOrderSchema,
   portfolioQuerySchema,
   providerFixtureResultSchema,
@@ -79,13 +86,15 @@ export type ClobRouteChain = {
   getExchangeOrderReadiness: typeof getExchangeOrderReadiness;
   validateExchangeOrder: typeof validateExchangeOrder;
   getAccountPortfolioBalances: typeof getAccountPortfolioBalances;
+  redemptionTransaction: typeof redemptionTransaction;
 };
 
 const defaultClobRouteChain: ClobRouteChain = {
   getMarketOnChain,
   getExchangeOrderReadiness,
   validateExchangeOrder,
-  getAccountPortfolioBalances
+  getAccountPortfolioBalances,
+  redemptionTransaction
 };
 
 export async function registerRoutes(
@@ -96,6 +105,35 @@ export async function registerRoutes(
   syncWorker?: ProviderSyncWorker,
   clobChain: ClobRouteChain = defaultClobRouteChain
 ): Promise<void> {
+  app.get("/events/markets", async (request, reply) => {
+    reply.hijack();
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no"
+    });
+
+    writeMarketEvent(reply.raw, {
+      id: randomUUID(),
+      type: "stream.connected",
+      at: new Date().toISOString()
+    });
+
+    const unsubscribe = store.marketEvents.subscribe((event) => {
+      writeMarketEvent(reply.raw, event);
+    });
+    const keepAlive = setInterval(() => {
+      reply.raw.write(": keep-alive\n\n");
+    }, 15_000);
+    keepAlive.unref();
+
+    request.raw.on("close", () => {
+      clearInterval(keepAlive);
+      unsubscribe();
+    });
+  });
+
   app.get("/health", async () => ({
     ok: true,
     service: "prediction-market-backend"
@@ -185,10 +223,14 @@ export async function registerRoutes(
     async (request, reply) => {
       const query = currentFixtureQuerySchema.parse(request.query);
       const sport = query.sport ?? (request.params.provider === "api-football" ? "football" : undefined);
+      const dates = currentDateWindow(query.days);
+      const sourceQueries = rangeCurrentFixtureProvider(request.params.provider)
+        ? [{ from: dates[0]!, to: dates[dates.length - 1]! }]
+        : dates.map((date) => ({ from: date }));
       const fixtures = (
         await Promise.all(
-          currentDateWindow(query.days).map((date) => {
-            const sourceQuery: FixtureQuery = { from: date };
+          sourceQueries.map((dateQuery) => {
+            const sourceQuery: FixtureQuery = { ...dateQuery };
             if (sport) sourceQuery.sport = sport;
             return sourceRegistry.get(request.params.provider).listFixtures(sourceQuery);
           })
@@ -470,6 +512,61 @@ export async function registerRoutes(
     markets: store.listMarkets()
   }));
 
+  app.get<{ Querystring: {
+    q?: string | undefined;
+    fixtureId?: string | undefined;
+    sport?: string | undefined;
+    status?: string | undefined;
+    tradingStatus?: string | undefined;
+    provider?: string | undefined;
+    fixtureStatus?: string | undefined;
+    marketType?: string | undefined;
+    category?: string | undefined;
+    competitionId?: string | undefined;
+    competitionName?: string | undefined;
+    sort?: string | undefined;
+    direction?: string | undefined;
+    offset?: string | undefined;
+    limit?: string | undefined;
+  } }>("/markets/summaries", async (request) => {
+    const query = marketListQuerySchema.parse(request.query);
+    const summaries = sortedMarketSummaries(store, filteredMarkets(store, query), query);
+    const page = pageItems(summaries, query);
+    return {
+      summaries: page.items,
+      pagination: page.pagination,
+      sort: discoverySort(query)
+    };
+  });
+
+  app.get<{ Querystring: {
+    q?: string | undefined;
+    fixtureId?: string | undefined;
+    sport?: string | undefined;
+    status?: string | undefined;
+    tradingStatus?: string | undefined;
+    provider?: string | undefined;
+    fixtureStatus?: string | undefined;
+    marketType?: string | undefined;
+    category?: string | undefined;
+    competitionId?: string | undefined;
+    competitionName?: string | undefined;
+    sort?: string | undefined;
+    direction?: string | undefined;
+    offset?: string | undefined;
+    limit?: string | undefined;
+  } }>("/markets/cards", async (request) => {
+    const query = marketListQuerySchema.parse(request.query);
+    const markets = filteredMarkets(store, query);
+    const cards = sortedMarketSummaryCards(buildMarketSummaryCards(store, markets), query);
+    const page = pageItems(cards, query);
+    return {
+      cards: page.items,
+      pagination: page.pagination,
+      sort: discoverySort(query)
+    };
+  });
+
   app.get<{ Params: { id: string } }>("/markets/:id", async (request, reply) => {
     const market = store.getMarket(request.params.id);
     if (!market) {
@@ -574,7 +671,7 @@ export async function registerRoutes(
     const input = prepareClobOrderSchema.parse(request.body);
     const market = store.getMarket(input.marketId);
     if (!market) return reply.code(404).send({ error: "Market not found" });
-    if (market.status !== "open") return reply.code(400).send({ error: "Only open markets accept orders" });
+    if (!marketAcceptsOrders(market)) return reply.code(400).send({ error: marketTradingError(market) });
 
     const [prepared, readiness] = await Promise.all([
       prepareExchangeOrder({
@@ -612,7 +709,7 @@ export async function registerRoutes(
     const input = clobOrderReadinessSchema.parse(request.body);
     const market = store.getMarket(input.marketId);
     if (!market) return reply.code(404).send({ error: "Market not found" });
-    if (market.status !== "open") return reply.code(400).send({ error: "Only open markets accept orders" });
+    if (!marketAcceptsOrders(market)) return reply.code(400).send({ error: marketTradingError(market) });
 
     return {
       market,
@@ -634,7 +731,7 @@ export async function registerRoutes(
     const input = submitClobOrderSchema.parse(request.body);
     const market = store.getMarket(input.marketId);
     if (!market) return reply.code(404).send({ error: "Market not found" });
-    if (market.status !== "open") return reply.code(400).send({ error: "Only open markets accept orders" });
+    if (!marketAcceptsOrders(market)) return reply.code(400).send({ error: marketTradingError(market) });
 
     const storedMarket = await clobChain.getMarketOnChain(input.marketId);
     if (!storedMarket) return reply.code(400).send({ error: "Market has not been created on-chain" });
@@ -783,6 +880,9 @@ export async function registerRoutes(
     const input = matchClobOrdersSchema.parse(request.body);
     const takerOrder = store.getClobOrder(input.takerOrderId);
     if (!takerOrder) return reply.code(404).send({ error: "Taker order not found" });
+    const market = store.getMarket(takerOrder.marketId);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+    if (!marketAcceptsOrders(market)) return reply.code(400).send({ error: marketTradingError(market) });
 
     const makerOrders = input.makerOrderIds.map((id) => store.getClobOrder(id));
     if (makerOrders.some((order) => !order)) {
@@ -826,28 +926,80 @@ export async function registerRoutes(
     if (!market) return reply.code(404).send({ error: "Market not found" });
 
     const orders = store.listClobOrders(market.id);
-    const trades = store.listClobTrades(market.id);
-    const lastTrade = trades[0];
-    const lastTaker = lastTrade ? store.getClobOrder(lastTrade.takerOrderId) : undefined;
 
     return {
       market,
       orderbook: buildOrderbook(orders),
-      priceData: {
-        lastTradePrice: lastTaker ? orderPrice(lastTaker) : undefined,
-        openOrderCount: orders.filter((order) => order.status === "open" || order.status === "partially_filled").length,
-        tradeCount: trades.length
-      }
+      priceData: marketPriceData(store, market.id, marketOutcomeSides(market))
     };
   });
 
-  app.get<{ Params: { id: string } }>("/markets/:id/trades", async (request, reply) => {
+  app.get<{ Params: { id: string }; Querystring: { limit?: string | undefined } }>(
+    "/markets/:id/trades",
+    async (request, reply) => {
+      const market = store.getMarket(request.params.id);
+      if (!market) return reply.code(404).send({ error: "Market not found" });
+      const query = marketTradesQuerySchema.parse(request.query);
+      const ticks = marketTradeTicks(store, market.id).slice(0, query.limit);
+      const tradeIds = new Set(ticks.map((tick) => tick.id));
+
+      return {
+        market,
+        ticks,
+        trades: store.listClobTrades(market.id).filter((trade) => tradeIds.has(trade.id)),
+        fills: store.listClobFills().filter((fill) => {
+          const order = store.getClobOrder(fill.orderId);
+          return order?.marketId === market.id && tradeIds.has(fill.tradeId);
+        })
+      };
+    }
+  );
+
+  app.get<{ Params: { id: string } }>("/markets/:id/price", async (request, reply) => {
     const market = store.getMarket(request.params.id);
     if (!market) return reply.code(404).send({ error: "Market not found" });
-    return { trades: store.listClobTrades(market.id), fills: store.listClobFills().filter((fill) => {
-      const order = store.getClobOrder(fill.orderId);
-      return order?.marketId === market.id;
-    }) };
+    return { market, prices: marketPriceData(store, market.id, marketOutcomeSides(market)) };
+  });
+
+  app.get<{ Params: { id: string }; Querystring: { interval?: string | undefined; limit?: string | undefined } }>(
+    "/markets/:id/chart",
+    async (request, reply) => {
+      const market = store.getMarket(request.params.id);
+      if (!market) return reply.code(404).send({ error: "Market not found" });
+      const query = marketChartQuerySchema.parse(request.query);
+      const ticks = marketTradeTicks(store, market.id).slice(0, query.limit);
+
+      return {
+        market,
+        interval: query.interval,
+        candles: marketCandles(ticks, query.interval, marketOutcomeSides(market))
+      };
+    }
+  );
+
+  app.get<{ Params: { id: string } }>("/markets/:id/summary", async (request, reply) => {
+    const market = store.getMarket(request.params.id);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+    return buildMarketSummary(store, market);
+  });
+
+  app.post<{ Params: { id: string } }>("/markets/:id/redeem-transaction", async (request, reply) => {
+    const market = store.getMarket(request.params.id);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+
+    const resolution = store.getResolution(market.id);
+    if (resolution?.status !== "submitted" || resolution.outcome === "VOID") {
+      return reply.code(400).send({
+        error: "Market does not have a submitted redeemable winning outcome"
+      });
+    }
+
+    return {
+      market,
+      resolution,
+      transaction: await clobChain.redemptionTransaction(market.id),
+      note: "The position holder wallet sends this Conditional Tokens redemption transaction."
+    };
   });
 
   app.get<{ Params: { account: string }; Querystring: { marketIds?: string | undefined } }>(
@@ -891,6 +1043,15 @@ export async function registerRoutes(
   );
 }
 
+function writeMarketEvent(
+  stream: NodeJS.WritableStream,
+  event: { id: string; type: string; at: string }
+): void {
+  stream.write(`id: ${event.id}\n`);
+  stream.write(`event: ${event.type}\n`);
+  stream.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
 function hasFixtureMismatch(market: MarketDefinition, resultFixtureId: string): boolean {
   return Boolean(market.fixtureId && market.fixtureId !== resultFixtureId);
 }
@@ -905,6 +1066,10 @@ function currentDateWindow(days: number): string[] {
   }
 
   return dates;
+}
+
+function rangeCurrentFixtureProvider(provider: string): boolean {
+  return provider === "api-football" || provider === "pandascore";
 }
 
 async function loadFixtureInsights(
@@ -1011,6 +1176,47 @@ function buildMarketCards(
   });
 }
 
+function buildMarketSummaryCards(store: InMemoryStore, markets: MarketDefinition[]) {
+  const fixtureMarkets = markets.filter((market) => market.fixtureId && store.getFixture(market.fixtureId));
+  const fixtureIds = new Set(fixtureMarkets.map((market) => market.fixtureId));
+  const fixtures = store.listFixtures().filter((fixture) => fixtureIds.has(fixture.id));
+  const fixtureCards = fixtures.flatMap((fixture) => {
+    const summaries = fixtureMarkets
+      .filter((market) => market.fixtureId === fixture.id)
+      .map((market) => buildMarketSummary(store, market));
+    const mainMarkets = summaries.filter((summary) => summary.market.template?.category !== "PLAYER");
+    const playerMarkets = summaries.filter((summary) => summary.market.template?.category === "PLAYER");
+
+    return [
+      ...(mainMarkets.length > 0 ? [{
+        type: "MATCH",
+        fixture,
+        summaries: mainMarkets
+      }] : []),
+      ...playerMarkets.map((summary) => ({
+        type: "PLAYER",
+        fixture,
+        playerName: summary.market.template?.category === "PLAYER"
+          ? summary.market.template.player.playerName
+          : undefined,
+        player: summary.market.template?.category === "PLAYER"
+          ? summary.market.template.player
+          : undefined,
+        summaries: [summary]
+      }))
+    ];
+  });
+  const fixtureCardIds = new Set(fixtureMarkets.map((market) => market.id));
+  const standaloneCards = markets
+    .filter((market) => !fixtureCardIds.has(market.id))
+    .map((market) => ({
+      type: "MARKET",
+      summaries: [buildMarketSummary(store, market)]
+    }));
+
+  return [...fixtureCards, ...standaloneCards];
+}
+
 function refreshStoredOrderStatus(
   order: StoredClobOrder,
   currentNonce: string,
@@ -1069,4 +1275,288 @@ async function loadPortfolioPositions(
   });
 
   return { collateral: balances.collateral, positions };
+}
+
+function marketOutcomeSides(market: MarketDefinition) {
+  return market.outcomes.map((outcome) => outcome.side);
+}
+
+function buildMarketSummary(store: InMemoryStore, market: MarketDefinition) {
+  return {
+    market,
+    fixture: market.fixtureId ? store.getFixture(market.fixtureId) : undefined,
+    resolution: store.getResolution(market.id),
+    summary: marketSummaryData(store, market.id, marketOutcomeSides(market))
+  };
+}
+
+function filteredMarkets(
+  store: InMemoryStore,
+  query: {
+    q?: string | undefined;
+    fixtureId?: string | undefined;
+    sport?: Fixture["sport"] | undefined;
+    status?: MarketDefinition["status"] | undefined;
+    tradingStatus?: MarketDefinition["tradingStatus"] | undefined;
+    provider?: string | undefined;
+    fixtureStatus?: FixtureStatus | undefined;
+    marketType?: MarketDefinition["type"] | undefined;
+    category?: "match" | "player" | "main_player" | "standalone" | undefined;
+    competitionId?: string | undefined;
+    competitionName?: string | undefined;
+  }
+) {
+  return store.listMarkets()
+    .filter((market) => !query.fixtureId || market.fixtureId === query.fixtureId)
+    .filter((market) => !query.status || market.status === query.status)
+    .filter((market) => !query.tradingStatus || market.tradingStatus === query.tradingStatus)
+    .filter((market) => !query.marketType || market.type === query.marketType)
+    .filter((market) => !query.category || discoveryCategory(market) === query.category)
+    .filter((market) => {
+      if (!query.provider) return true;
+      return discoveryProvider(store, market)?.toLowerCase() === query.provider.toLowerCase();
+    })
+    .filter((market) => {
+      if (!query.sport) return true;
+      if (!market.fixtureId) return false;
+      return store.getFixture(market.fixtureId)?.sport === query.sport;
+    })
+    .filter((market) => {
+      if (!query.fixtureStatus) return true;
+      if (!market.fixtureId) return false;
+      return store.getFixture(market.fixtureId)?.status === query.fixtureStatus;
+    })
+    .filter((market) => {
+      if (!query.competitionId) return true;
+      if (!market.fixtureId) return false;
+      return store.getFixture(market.fixtureId)?.competition?.id?.toLowerCase() === query.competitionId.toLowerCase();
+    })
+    .filter((market) => {
+      if (!query.competitionName) return true;
+      if (!market.fixtureId) return false;
+      return store.getFixture(market.fixtureId)?.competition?.name.toLowerCase()
+        .includes(query.competitionName.toLowerCase()) ?? false;
+    })
+    .filter((market) => !query.q || matchesDiscoverySearch(store, market, query.q));
+}
+
+type MarketDiscoverySort = {
+  sort: "kickoff_time" | "live_status" | "volume" | "newest_activity";
+  direction: "asc" | "desc";
+};
+
+type MarketDiscoveryQuery = {
+  sort: MarketDiscoverySort["sort"];
+  direction?: MarketDiscoverySort["direction"] | undefined;
+  offset: number;
+  limit: number;
+};
+
+type MarketSummaryPayload = ReturnType<typeof buildMarketSummary>;
+
+function sortedMarketSummaries(
+  store: InMemoryStore,
+  markets: MarketDefinition[],
+  query: MarketDiscoveryQuery
+) {
+  const sort = discoverySort(query);
+  return markets
+    .map((market) => buildMarketSummary(store, market))
+    .sort((left, right) => compareDiscoverySummaries(left, right, sort));
+}
+
+function sortedMarketSummaryCards<T extends {
+  type: string;
+  fixture?: Fixture | undefined;
+  summaries: MarketSummaryPayload[];
+}>(cards: T[], query: MarketDiscoveryQuery) {
+  const sort = discoverySort(query);
+  return cards.sort((left, right) => compareDiscoveryCards(left, right, sort));
+}
+
+function discoverySort(query: Pick<MarketDiscoveryQuery, "sort" | "direction">): MarketDiscoverySort {
+  return {
+    sort: query.sort,
+    direction: query.direction ?? (query.sort === "kickoff_time" ? "asc" : "desc")
+  };
+}
+
+function compareDiscoverySummaries(
+  left: MarketSummaryPayload,
+  right: MarketSummaryPayload,
+  sort: MarketDiscoverySort
+): number {
+  switch (sort.sort) {
+    case "kickoff_time":
+      return compareKickoff(left.fixture, right.fixture, sort.direction)
+        || compareMarketIds(left.market.id, right.market.id);
+    case "live_status":
+      return compareNumbers(liveRank(left.fixture), liveRank(right.fixture), sort.direction)
+        || compareKickoff(left.fixture, right.fixture, "asc")
+        || compareMarketIds(left.market.id, right.market.id);
+    case "volume":
+      return compareBigInts(BigInt(left.summary.volume), BigInt(right.summary.volume), sort.direction)
+        || compareKickoff(left.fixture, right.fixture, "asc")
+        || compareMarketIds(left.market.id, right.market.id);
+    case "newest_activity":
+      return compareNumbers(activityTime(left.summary.latestActivityAt), activityTime(right.summary.latestActivityAt), sort.direction)
+        || compareKickoff(left.fixture, right.fixture, "asc")
+        || compareMarketIds(left.market.id, right.market.id);
+  }
+}
+
+function compareDiscoveryCards(
+  left: { type: string; fixture?: Fixture | undefined; summaries: MarketSummaryPayload[] },
+  right: { type: string; fixture?: Fixture | undefined; summaries: MarketSummaryPayload[] },
+  sort: MarketDiscoverySort
+): number {
+  switch (sort.sort) {
+    case "kickoff_time":
+      return compareKickoff(cardFixture(left), cardFixture(right), sort.direction)
+        || compareMarketIds(cardStableId(left), cardStableId(right));
+    case "live_status":
+      return compareNumbers(liveRank(cardFixture(left)), liveRank(cardFixture(right)), sort.direction)
+        || compareKickoff(cardFixture(left), cardFixture(right), "asc")
+        || compareMarketIds(cardStableId(left), cardStableId(right));
+    case "volume":
+      return compareBigInts(cardVolume(left), cardVolume(right), sort.direction)
+        || compareKickoff(cardFixture(left), cardFixture(right), "asc")
+        || compareMarketIds(cardStableId(left), cardStableId(right));
+    case "newest_activity":
+      return compareNumbers(cardActivityTime(left), cardActivityTime(right), sort.direction)
+        || compareKickoff(cardFixture(left), cardFixture(right), "asc")
+        || compareMarketIds(cardStableId(left), cardStableId(right));
+  }
+}
+
+function pageItems<T>(items: T[], query: Pick<MarketDiscoveryQuery, "offset" | "limit">) {
+  const end = query.offset + query.limit;
+  return {
+    items: items.slice(query.offset, end),
+    pagination: {
+      offset: query.offset,
+      limit: query.limit,
+      total: items.length,
+      hasMore: end < items.length,
+      nextOffset: end < items.length ? end : undefined
+    }
+  };
+}
+
+function compareKickoff(
+  left?: Fixture,
+  right?: Fixture,
+  direction: MarketDiscoverySort["direction"] = "asc"
+): number {
+  const leftTime = left ? Date.parse(left.kickoffTime) : undefined;
+  const rightTime = right ? Date.parse(right.kickoffTime) : undefined;
+  if (leftTime === undefined && rightTime === undefined) return 0;
+  if (leftTime === undefined) return 1;
+  if (rightTime === undefined) return -1;
+  return compareNumbers(leftTime, rightTime, direction);
+}
+
+function compareNumbers(left: number, right: number, direction: MarketDiscoverySort["direction"]): number {
+  if (left === right) return 0;
+  return direction === "asc"
+    ? left < right ? -1 : 1
+    : left > right ? -1 : 1;
+}
+
+function compareBigInts(left: bigint, right: bigint, direction: MarketDiscoverySort["direction"]): number {
+  if (left === right) return 0;
+  return direction === "asc"
+    ? left < right ? -1 : 1
+    : left > right ? -1 : 1;
+}
+
+function compareMarketIds(left: string, right: string): number {
+  return left.localeCompare(right);
+}
+
+function liveRank(fixture?: Fixture): number {
+  return fixture?.status === "live" ? 1 : 0;
+}
+
+function activityTime(value?: string): number {
+  return value ? Date.parse(value) : 0;
+}
+
+function cardFixture(card: { fixture?: Fixture | undefined; summaries: MarketSummaryPayload[] }) {
+  return card.fixture ?? card.summaries[0]?.fixture;
+}
+
+function cardStableId(card: { type: string; summaries: MarketSummaryPayload[] }) {
+  return `${card.type}:${card.summaries.map((summary) => summary.market.id).join(",")}`;
+}
+
+function cardVolume(card: { summaries: MarketSummaryPayload[] }): bigint {
+  return card.summaries.reduce((total, summary) => total + BigInt(summary.summary.volume), 0n);
+}
+
+function cardActivityTime(card: { summaries: MarketSummaryPayload[] }): number {
+  return card.summaries.reduce(
+    (latest, summary) => Math.max(latest, activityTime(summary.summary.latestActivityAt)),
+    0
+  );
+}
+
+function discoveryProvider(store: InMemoryStore, market: MarketDefinition): string | undefined {
+  return market.source?.provider
+    ?? market.resolver?.source.provider
+    ?? (market.fixtureId ? store.getFixture(market.fixtureId)?.source.provider : undefined);
+}
+
+function discoveryCategory(market: MarketDefinition) {
+  if (!market.fixtureId) return "standalone";
+  if (market.template?.category === "PLAYER") return "player";
+  if (market.template?.category === "MAIN_PLAYER") return "main_player";
+  return "match";
+}
+
+function matchesDiscoverySearch(store: InMemoryStore, market: MarketDefinition, query: string): boolean {
+  const fixture = market.fixtureId ? store.getFixture(market.fixtureId) : undefined;
+  const player = market.template?.category === "PLAYER" || market.template?.category === "MAIN_PLAYER"
+    ? market.template.player
+    : undefined;
+  const terms = [
+    market.id,
+    market.title,
+    market.type,
+    market.status,
+    market.tradingStatus,
+    market.tradingStatusReason,
+    market.source?.provider,
+    market.resolver?.source.provider,
+    market.resolver?.rule,
+    market.outcomes.map((outcome) => outcome.label).join(" "),
+    fixture?.id,
+    fixture?.source.provider,
+    fixture?.homeCompetitor,
+    fixture?.awayCompetitor,
+    fixture?.competition?.id,
+    fixture?.competition?.name,
+    fixture?.competition?.season,
+    fixture?.competition?.kind,
+    fixture && "gameTitle" in fixture ? fixture.gameTitle : undefined,
+    fixture && "tournamentName" in fixture ? fixture.tournamentName : undefined,
+    player?.playerId,
+    player?.playerName
+  ];
+  const needle = query.toLowerCase();
+
+  return terms
+    .filter((term): term is string => typeof term === "string")
+    .some((term) => term.toLowerCase().includes(needle));
+}
+
+function marketAcceptsOrders(market: MarketDefinition): boolean {
+  return market.status === "open" && market.tradingStatus === "open";
+}
+
+function marketTradingError(market: MarketDefinition): string {
+  if (market.status !== "open") return "Only open markets accept orders";
+  return market.tradingStatusReason
+    ? `Market trading is ${market.tradingStatus}: ${market.tradingStatusReason}`
+    : `Market trading is ${market.tradingStatus}`;
 }

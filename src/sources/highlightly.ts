@@ -148,6 +148,11 @@ export class HighlightlySource implements MarketDataSource {
         sourceUrl: `${this.baseUrl}/matches?matchId=${match.id}`,
         fetchedAt: new Date().toISOString()
       },
+      competition: {
+        kind: "competition",
+        id: match.league,
+        name: match.league
+      },
       homeCompetitor: match.homeTeam.name,
       awayCompetitor: match.awayTeam.name,
       ...(teamLogoUrl(match.homeTeam) ? { homeLogoUrl: teamLogoUrl(match.homeTeam) } : {}),

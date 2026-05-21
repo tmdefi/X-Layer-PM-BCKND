@@ -65,6 +65,7 @@ export function createYesNoMarket(input: {
     type: "YES_NO",
     title: input.title,
     status: input.status ?? "draft",
+    tradingStatus: input.status === "open" ? "open" : "closed",
     outcomes: YES_NO_OUTCOMES,
     ...(input.fixtureId ? { fixtureId: input.fixtureId } : {}),
     ...(input.source ? { source: input.source } : {}),
@@ -86,6 +87,7 @@ export function createTotalGoalsMarket(
     line,
     title: `${fixture.homeCompetitor} vs ${fixture.awayCompetitor} - Total Goals ${line}`,
     status,
+    tradingStatus: status === "open" ? "open" : "closed",
     source: fixture.source,
     resolver: {
       rule: "TOTAL_GOALS",
@@ -109,6 +111,7 @@ export function createBothTeamsToScoreMarket(
     sport: "football",
     title: `${fixture.homeCompetitor} vs ${fixture.awayCompetitor} - Both Teams To Score`,
     status,
+    tradingStatus: status === "open" ? "open" : "closed",
     source: fixture.source,
     resolver: {
       rule: "BOTH_TEAMS_TO_SCORE",

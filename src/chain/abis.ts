@@ -181,6 +181,18 @@ export const erc20CollateralAbi = [
 export const erc1155ConditionalTokensAbi = [
   {
     type: "function",
+    name: "redeemPositions",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "collateralToken", type: "address" },
+      { name: "parentCollectionId", type: "bytes32" },
+      { name: "conditionId", type: "bytes32" },
+      { name: "indexSets", type: "uint256[]" }
+    ],
+    outputs: []
+  },
+  {
+    type: "function",
     name: "balanceOf",
     stateMutability: "view",
     inputs: [

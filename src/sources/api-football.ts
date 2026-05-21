@@ -472,6 +472,12 @@ export class ApiFootballSource implements MarketDataSource {
         sourceUrl: `${this.baseUrl}/fixtures?id=${input.fixture.id}`,
         fetchedAt: new Date().toISOString()
       },
+      competition: {
+        kind: "league",
+        id: String(input.league.id),
+        name: input.league.name ?? `League ${input.league.id}`,
+        season: String(input.league.season)
+      },
       homeCompetitor: input.teams.home.name,
       awayCompetitor: input.teams.away.name,
       ...(input.teams.home.logo ? { homeLogoUrl: input.teams.home.logo } : {}),
