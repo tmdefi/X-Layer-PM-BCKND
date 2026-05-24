@@ -17,6 +17,7 @@ import {
   type ExchangeOrderReadiness
 } from "../src/chain/exchange.js";
 import {
+  createEsportsFixtureMarkets,
   createFootballFixtureMarkets,
   createMainCardPlayerMarket,
   createMmaFixtureMarkets,
@@ -428,6 +429,40 @@ test("MMA winner markets void a finished fight without one fighter winner", () =
 
   assert.equal(decision.outcome, "VOID");
   assert.deepEqual(decision.payoutVector, [1, 1]);
+});
+
+test("PandaScore esports winner markets resolve from explicit winner without score", () => {
+  const fixture = {
+    id: "pandascore:fixture-1",
+    sport: "esports" as const,
+    source: { provider: "pandascore", externalFixtureId: "fixture-1" },
+    homeCompetitor: "Home Esports",
+    awayCompetitor: "Away Esports",
+    kickoffTime: "2026-05-21T00:00:00.000Z",
+    status: "finished" as const
+  };
+  const markets = createEsportsFixtureMarkets(fixture, { status: "open" });
+  const homeMarket = markets.find((market) => market.resolver?.rule === "HOME_TEAM_WIN");
+  const awayMarket = markets.find((market) => market.resolver?.rule === "AWAY_TEAM_WIN");
+  assert.ok(homeMarket);
+  assert.ok(awayMarket);
+
+  const homeWinnerResult = {
+    fixtureId: fixture.id,
+    source: fixture.source,
+    status: "finished" as const,
+    explicitOutcome: "YES" as const,
+    observedAt: "2026-05-21T01:00:00.000Z"
+  };
+  assert.equal(computeResolutionDecision(homeMarket, homeWinnerResult).outcome, "YES");
+  assert.equal(computeResolutionDecision(awayMarket, homeWinnerResult).outcome, "NO");
+
+  const awayWinnerResult = {
+    ...homeWinnerResult,
+    explicitOutcome: "NO" as const
+  };
+  assert.equal(computeResolutionDecision(homeMarket, awayWinnerResult).outcome, "NO");
+  assert.equal(computeResolutionDecision(awayMarket, awayWinnerResult).outcome, "YES");
 });
 
 test("orderbook aggregates open levels and excludes filled orders", () => {

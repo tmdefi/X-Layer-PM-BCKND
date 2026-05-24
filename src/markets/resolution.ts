@@ -152,6 +152,9 @@ function computeOutcome(market: MarketDefinition, result: ProviderFixtureResult)
       return resolveMarket(market, result.score);
     case "YES_NO":
       if (market.resolver?.rule === "HOME_TEAM_WIN") {
+        if (isPandaScoreWinnerMarket(market) && result.explicitOutcome) {
+          return result.explicitOutcome;
+        }
         if (!result.score) {
           throw new Error(`Cannot resolve HOME_TEAM_WIN market ${market.id}: score is missing`);
         }
@@ -169,6 +172,9 @@ function computeOutcome(market: MarketDefinition, result: ProviderFixtureResult)
       }
 
       if (market.resolver?.rule === "AWAY_TEAM_WIN") {
+        if (isPandaScoreWinnerMarket(market) && result.explicitOutcome) {
+          return invertYesNoOutcome(result.explicitOutcome);
+        }
         if (!result.score) {
           throw new Error(`Cannot resolve AWAY_TEAM_WIN market ${market.id}: score is missing`);
         }
@@ -392,6 +398,20 @@ function isTieVoidWinnerMarket(market: MarketDefinition): boolean {
     (market.source?.provider === "highlightly" || market.source?.provider === "api-mma") &&
     (market.resolver?.rule === "HOME_TEAM_WIN" || market.resolver?.rule === "AWAY_TEAM_WIN")
   );
+}
+
+function isPandaScoreWinnerMarket(market: MarketDefinition): boolean {
+  return (
+    market.type === "YES_NO" &&
+    market.resolver?.source.provider === "pandascore" &&
+    (market.resolver.rule === "HOME_TEAM_WIN" || market.resolver.rule === "AWAY_TEAM_WIN")
+  );
+}
+
+function invertYesNoOutcome(outcome: ResolutionOutcome): ResolutionOutcome {
+  if (outcome === "YES") return "NO";
+  if (outcome === "NO") return "YES";
+  return outcome;
 }
 
 function playerScored(result: ProviderFixtureResult, player: PlayerIdentity): boolean {
