@@ -124,6 +124,27 @@ npm run prisma:deploy
 npm test
 ```
 
+## Railway Deployment
+
+This repo includes `railway.json` for Railway/Nixpacks deployment. Railway should run:
+
+```sh
+npm run prisma:generate && npm run build
+HOST=0.0.0.0 npm run start
+```
+
+The `/health` route is used as the deployment health check.
+
+Recommended Railway setup:
+
+1. Create a Railway project and deploy this backend repo or the `backend` directory.
+2. Add Railway Postgres and set `DATABASE_ENABLED=true`.
+3. Set `DATABASE_URL` from the Railway Postgres connection string. Set `DIRECT_URL` too if you want to run Prisma migrations from Railway.
+4. Run `npm run prisma:deploy` once after Postgres is attached and the database env vars are present.
+5. Add the X Layer, contract, provider API, and operator env vars from `.env.example`.
+
+For production-like testnet behavior, use `HOST=0.0.0.0`, keep `PORT` unset so Railway can inject it, and only enable `SETTLEMENT_SUBMIT_ON_CHAIN=true` when the backend wallet is funded and intended to submit resolver transactions.
+
 ## Wallet Connection
 
 The frontend can bootstrap wallet connection from the public backend config route:
