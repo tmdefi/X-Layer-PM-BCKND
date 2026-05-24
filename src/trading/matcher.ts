@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { Hex } from "viem";
 import { matchExchangeOrders } from "../chain/index.js";
 import type { InMemoryStore } from "../api/store.js";
+import { runTrackedOperatorTransaction } from "../api/operator-transactions.js";
 import { env } from "../config/env.js";
 import { proportionalTakingAmount } from "./orderbook.js";
 import type { StoredClobFill, StoredClobOrder, StoredClobTrade } from "./types.js";
@@ -120,17 +121,72 @@ export async function tickAutoMatcher(
 }
 
 export async function executeMatchPlan(store: InMemoryStore, plan: MatchPlan): Promise<MatchResult> {
-  const transactionHash = await matchExchangeOrders({
-    takerOrder: plan.takerOrder,
-    makerOrders: plan.makerOrders,
-    takerFillAmount: plan.takerFillAmount,
-    makerFillAmounts: plan.makerFillAmounts
+  const transactionHash = await runTrackedOperatorTransaction(store, {
+    action: "MATCH_ORDERS",
+    entityId: matchPlanEntityId(plan),
+    metadata: {
+      marketId: plan.takerOrder.marketId,
+      takerOrderId: plan.takerOrder.id,
+      makerOrderIds: plan.makerOrders.map((order) => order.id),
+      takerFillAmount: plan.takerFillAmount,
+      makerFillAmounts: plan.makerFillAmounts,
+      shareSize: plan.shareSize
+    },
+    execute: (onSubmitted) => matchExchangeOrders({
+      takerOrder: plan.takerOrder,
+      makerOrders: plan.makerOrders,
+      takerFillAmount: plan.takerFillAmount,
+      makerFillAmounts: plan.makerFillAmounts,
+      onSubmitted
+    })
   });
   return recordSuccessfulMatch(store, plan, transactionHash);
 }
 
 export function recordMatchResult(store: InMemoryStore, plan: MatchPlan, transactionHash: Hex): MatchResult {
   return recordSuccessfulMatch(store, plan, transactionHash);
+}
+
+export type RecoverableMatchMetadata = {
+  marketId: string;
+  takerOrderId: string;
+  makerOrderIds: string[];
+  takerFillAmount: string;
+  makerFillAmounts: string[];
+  shareSize: string;
+};
+
+export function recoverMatchPlan(store: InMemoryStore, metadata: RecoverableMatchMetadata): MatchPlan {
+  const takerOrder = store.getClobOrder(metadata.takerOrderId);
+  if (!takerOrder) throw new Error(`Recovery taker order not found: ${metadata.takerOrderId}`);
+  const makerOrders = metadata.makerOrderIds.map((id) => store.getClobOrder(id));
+  if (makerOrders.some((order) => !order)) {
+    throw new Error(`Recovery maker order not found for match ${metadata.takerOrderId}`);
+  }
+  if (takerOrder.marketId !== metadata.marketId) {
+    throw new Error(`Recovery market mismatch for taker order ${metadata.takerOrderId}`);
+  }
+
+  return {
+    takerOrder,
+    makerOrders: makerOrders as StoredClobOrder[],
+    takerFillAmount: metadata.takerFillAmount,
+    makerFillAmounts: metadata.makerFillAmounts,
+    shareSize: metadata.shareSize
+  };
+}
+
+export function isRecoverableMatchMetadata(value: unknown): value is RecoverableMatchMetadata {
+  if (!value || typeof value !== "object") return false;
+  const metadata = value as Partial<RecoverableMatchMetadata>;
+  return typeof metadata.marketId === "string"
+    && typeof metadata.takerOrderId === "string"
+    && Array.isArray(metadata.makerOrderIds)
+    && metadata.makerOrderIds.every((id) => typeof id === "string")
+    && typeof metadata.takerFillAmount === "string"
+    && Array.isArray(metadata.makerFillAmounts)
+    && metadata.makerFillAmounts.every((amount) => typeof amount === "string")
+    && typeof metadata.shareSize === "string";
 }
 
 export function manualMatchPlan(input: {
@@ -277,4 +333,13 @@ function createFill(
 
 function min(left: bigint, right: bigint): bigint {
   return left < right ? left : right;
+}
+
+function matchPlanEntityId(plan: MatchPlan): string {
+  return [
+    plan.takerOrder.id,
+    ...plan.makerOrders.map((order) => order.id),
+    plan.takerFillAmount,
+    ...plan.makerFillAmounts
+  ].join(":");
 }

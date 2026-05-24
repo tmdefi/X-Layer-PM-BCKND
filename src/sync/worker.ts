@@ -1,8 +1,9 @@
 import { env } from "../config/env.js";
 import { createMarketOnChain, getMarketOnChain } from "../chain/index.js";
-import { createBasketballFixtureMarkets, createFootballFixtureMarkets } from "../markets/definitions.js";
-import type { BasketballFixture, Fixture, FootballFixture, MarketDefinition, Sport } from "../markets/types.js";
+import { createBasketballFixtureMarkets, createEsportsFixtureMarkets, createFootballFixtureMarkets, createMmaFixtureMarkets } from "../markets/definitions.js";
+import type { BasketballFixture, EsportsFixture, Fixture, FootballFixture, MarketDefinition, MmaFixture, Sport } from "../markets/types.js";
 import type { InMemoryStore } from "../api/store.js";
+import { runTrackedOperatorTransaction } from "../api/operator-transactions.js";
 import type { FixtureQuery, SourceRegistry } from "../sources/index.js";
 
 type SyncLogger = {
@@ -291,10 +292,20 @@ export class ProviderSyncWorker {
         const existing = await getMarketOnChain(market.id);
         const conditionId =
           existing?.conditionId ??
-          (await createMarketOnChain({
-            marketId: market.id,
-            marketType: market.type,
-            metadataURI: `market:${market.id}`
+          (await runTrackedOperatorTransaction(this.options.store, {
+            action: "CREATE_MARKET",
+            entityId: market.id,
+            metadata: {
+              marketId: market.id,
+              marketType: market.type,
+              source: "sync"
+            },
+            execute: (onSubmitted) => createMarketOnChain({
+              marketId: market.id,
+              marketType: market.type,
+              metadataURI: `market:${market.id}`,
+              onSubmitted
+            })
           })).conditionId;
 
         if (!conditionId) {
@@ -330,38 +341,36 @@ export function createProviderSyncWorker(options: ProviderSyncWorkerOptions): Pr
 function createMarketsForFixture(fixture: Fixture): MarketDefinition[] {
   if (fixture.sport === "football") return createFootballFixtureMarkets(fixture as FootballFixture, { status: "open" });
   if (fixture.sport === "basketball") return createBasketballFixtureMarkets(fixture as BasketballFixture, { status: "open" });
+  if (fixture.sport === "mma") return createMmaFixtureMarkets(fixture as MmaFixture, { status: "open" });
+  if (fixture.sport === "esports") return createEsportsFixtureMarkets(fixture as EsportsFixture, { status: "open" });
   return [];
 }
 
 function preserveTerminalMarketStatus(next: MarketDefinition, current: MarketDefinition | undefined): MarketDefinition {
   if (!current) return next;
-  const nextWithChainState = {
+
+  const isTerminal = current.status === "closed" || current.status === "resolved" || current.status === "cancelled";
+
+  return {
     ...next,
     ...(current.conditionId ? { conditionId: current.conditionId } : {}),
-    tradingStatus: current.tradingStatus,
+    ...(isTerminal ? { tradingStatus: current.tradingStatus } : {}),
+    ...(isTerminal ? { status: current.status } : {}),
     ...(current.tradingStatusReason ? { tradingStatusReason: current.tradingStatusReason } : {}),
     ...(current.tradingStatusUpdatedAt ? { tradingStatusUpdatedAt: current.tradingStatusUpdatedAt } : {})
   } as MarketDefinition;
-
-  if (current.status === "closed" || current.status === "resolved" || current.status === "cancelled") {
-    return {
-      ...nextWithChainState,
-      status: current.status
-    };
-  }
-
-  return nextWithChainState;
 }
 
 function defaultSportForProvider(provider: string): Sport | undefined {
   if (provider === "api-football") return "football";
+  if (provider === "api-mma") return "mma";
   if (provider === "highlightly") return "basketball";
   if (provider === "pandascore") return "esports";
   return undefined;
 }
 
 function rangeFixtureProvider(provider: string): boolean {
-  return provider === "api-football" || provider === "pandascore";
+  return provider === "api-football" || provider === "api-mma" || provider === "pandascore";
 }
 
 function syncDaysForProvider(provider: string, defaultDays: number): number {

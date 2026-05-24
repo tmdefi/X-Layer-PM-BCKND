@@ -363,19 +363,25 @@ export async function validateExchangeOrder(order: ExchangeOrder): Promise<Hex> 
   const exchange = exchangeAddress();
   const contractOrder = toContractOrder(order);
 
-  await clients.publicClient.readContract({
-    address: exchange,
-    abi: ctfExchangeAbi,
-    functionName: "validateOrder",
-    args: [contractOrder]
-  });
-
-  return clients.publicClient.readContract({
+  const orderHash = await clients.publicClient.readContract({
     address: exchange,
     abi: ctfExchangeAbi,
     functionName: "hashOrder",
     args: [contractOrder]
   });
+
+  try {
+    await clients.publicClient.readContract({
+      address: exchange,
+      abi: ctfExchangeAbi,
+      functionName: "validateOrder",
+      args: [contractOrder]
+    });
+  } catch {
+    throw Object.assign(new Error("Order failed on-chain validation"), { statusCode: 400 });
+  }
+
+  return orderHash;
 }
 
 export async function getExchangeNonce(maker: Address): Promise<string> {
@@ -454,6 +460,7 @@ export async function matchExchangeOrders(input: {
   makerOrders: StoredClobOrder[];
   takerFillAmount: string;
   makerFillAmounts: string[];
+  onSubmitted?: ((hash: Hex) => void) | undefined;
 }): Promise<Hex> {
   const clients = createChainClients();
   const exchange = exchangeAddress();
@@ -469,6 +476,7 @@ export async function matchExchangeOrders(input: {
     ],
     account: clients.account
   });
+  input.onSubmitted?.(hash);
   const receipt = await clients.publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`Order match transaction failed: ${hash}`);
   return hash;

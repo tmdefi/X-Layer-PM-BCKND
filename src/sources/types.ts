@@ -13,6 +13,7 @@ export type FixtureQuery = {
 export type PlayerCandidateQuery = {
   externalFixtureId: string;
   limitPerTeam?: number | undefined;
+  cache?: PlayerCandidateCache | undefined;
 };
 
 export type PlayerCandidate = {
@@ -27,6 +28,11 @@ export type PlayerCandidate = {
     minutes: number;
     position?: string | undefined;
   };
+};
+
+export type PlayerCandidateCache = {
+  getPlayerCandidates(cacheKey: string): { candidates: PlayerCandidate[] } | undefined;
+  upsertPlayerCandidates(cacheKey: string, candidates: PlayerCandidate[], ttlMs: number): unknown;
 };
 
 export type FixtureInsightsQuery = {

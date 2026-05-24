@@ -33,7 +33,7 @@ export function requireAddress(value: string | undefined, name: string): Address
   return value as Address;
 }
 
-function xLayerChain() {
+export function xLayerChain() {
   return {
     id: env.XLAYER_CHAIN_ID,
     name: env.XLAYER_CHAIN_ID === 196 ? "X Layer" : "X Layer Testnet",

@@ -6,6 +6,7 @@ import { env } from "../config/env.js";
 import { createSettlementWorker } from "../settlement/index.js";
 import { createDefaultSourceRegistry } from "../sources/index.js";
 import { createProviderSyncWorker } from "../sync/index.js";
+import { createOperatorTransactionRecoveryWorker } from "../operator-recovery/index.js";
 import { registerRoutes } from "./routes.js";
 import { PrismaBackedStore, createStore } from "./store.js";
 
@@ -24,6 +25,10 @@ export async function buildApp() {
   const syncWorker = createProviderSyncWorker({
     store,
     sourceRegistry,
+    logger: app.log
+  });
+  const operatorRecoveryWorker = createOperatorTransactionRecoveryWorker({
+    store,
     logger: app.log
   });
 
@@ -51,12 +56,11 @@ export async function buildApp() {
 
     app.log.error(error);
     return reply.code(500).send({
-      error: "Internal server error",
-      message: error instanceof Error ? error.message : "Unknown error"
+      error: "Internal server error"
     });
   });
 
-  await registerRoutes(app, store, sourceRegistry, settlementWorker, syncWorker);
+  await registerRoutes(app, store, sourceRegistry, settlementWorker, syncWorker, undefined, operatorRecoveryWorker);
 
   if (env.SETTLEMENT_WORKER_ENABLED) {
     settlementWorker.start();
@@ -66,9 +70,14 @@ export async function buildApp() {
     syncWorker.start();
   }
 
+  if (env.OPERATOR_TX_RECOVERY_WORKER_ENABLED) {
+    operatorRecoveryWorker.start();
+  }
+
   app.addHook("onClose", async () => {
     settlementWorker.stop();
     syncWorker.stop();
+    operatorRecoveryWorker.stop();
     if (store instanceof PrismaBackedStore) {
       await store.disconnect();
     }

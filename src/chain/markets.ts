@@ -8,6 +8,7 @@ export type OnChainMarketCreationInput = {
   questionId?: Hex | undefined;
   marketType: string;
   metadataURI: string;
+  onSubmitted?: ((hash: Hex) => void) | undefined;
 };
 
 export type OnChainMarketCreationResult = {
@@ -53,6 +54,7 @@ export async function createMarketOnChain(
     args: [marketId, resolver, questionId, input.marketType, input.metadataURI],
     account: clients.account
   });
+  input.onSubmitted?.(hash);
 
   const receipt = await clients.publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") {
@@ -96,7 +98,8 @@ export async function getMarketOnChain(marketId: string): Promise<OnChainStoredM
 
 export async function resolveMarketOnChain(
   questionId: Hex,
-  outcome: ResolverOutcome
+  outcome: ResolverOutcome,
+  options: { onSubmitted?: ((hash: Hex) => void) | undefined } = {}
 ): Promise<OnChainResolutionResult> {
   const clients = createChainClients();
   const resolver = requireAddress(env.BINARY_MARKET_RESOLVER_ADDRESS, "BINARY_MARKET_RESOLVER_ADDRESS");
@@ -109,6 +112,7 @@ export async function resolveMarketOnChain(
     args: [questionId, outcomeIndex],
     account: clients.account
   });
+  options.onSubmitted?.(hash);
 
   const [receipt, conditionId] = await Promise.all([
     clients.publicClient.waitForTransactionReceipt({ hash }),
@@ -140,6 +144,10 @@ export function outcomeSideToResolverOutcome(outcome: string): ResolverOutcome {
 
 export function hashIdentifier(value: string): Hex {
   return keccak256(stringToHex(value));
+}
+
+export async function getOperatorTransactionReceipt(hash: Hex) {
+  return createPublicChainClient().getTransactionReceipt({ hash });
 }
 
 function findMarketCreatedEvent(receipt: TransactionReceipt, marketFactory: Address) {

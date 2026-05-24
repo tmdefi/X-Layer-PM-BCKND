@@ -3,8 +3,14 @@ import test from "node:test";
 import Fastify from "fastify";
 import { decodeFunctionData, type Address, type Hex } from "viem";
 import { InMemoryStore } from "../src/api/store.js";
+import {
+  operatorTransactionRetryPolicy,
+  runTrackedOperatorTransaction
+} from "../src/api/operator-transactions.js";
+import { createOperatorTransactionRecoveryWorker } from "../src/operator-recovery/index.js";
 import { registerRoutes, type ClobRouteChain } from "../src/api/routes.js";
 import { erc1155ConditionalTokensAbi, erc20CollateralAbi } from "../src/chain/abis.js";
+import { env } from "../src/config/env.js";
 import {
   buildBuyOrderReadiness,
   buildSellOrderReadiness,
@@ -13,14 +19,20 @@ import {
 import {
   createFootballFixtureMarkets,
   createMainCardPlayerMarket,
+  createMmaFixtureMarkets,
+  createPlayerTournamentFutureMarket,
   createYesNoMarket
 } from "../src/markets/definitions.js";
 import { footballLiveTradingCloseReason } from "../src/markets/live-trading.js";
 import {
   computeEarlyResolutionDecision,
+  computeResolutionDecision,
   confirmEarlyResolutionDecision
 } from "../src/markets/resolution.js";
 import { SourceRegistry } from "../src/sources/index.js";
+import { ApiFootballSource } from "../src/sources/api-football.js";
+import { ApiMmaSource } from "../src/sources/api-mma.js";
+import { createSettlementWorker } from "../src/settlement/index.js";
 import { buildOrderbook } from "../src/trading/orderbook.js";
 import { manualMatchPlan, planComplementaryMatch, recordMatchResult } from "../src/trading/matcher.js";
 import type { ExchangeOrder, StoredClobOrder } from "../src/trading/types.js";
@@ -83,6 +95,21 @@ test("SELL readiness checks Conditional Tokens approval payload", () => {
   });
   assert.equal(decoded.functionName, "setApprovalForAll");
   assert.deepEqual(decoded.args, [exchange, true]);
+});
+
+test("wallet config exposes X Layer connection data without backend secrets", async () => {
+  const app = await testApp(marketStore(), readyClobChain());
+  const response = await app.inject({ method: "GET", url: "/wallet/config" });
+  const config = response.json();
+
+  assert.equal(response.statusCode, 200);
+  assert.ok(config.chain.id > 0);
+  assert.equal(config.chain.hexId, `0x${config.chain.id.toString(16)}`);
+  assert.equal(config.walletAddEthereumChain.chainId, config.chain.hexId);
+  assert.equal(config.clobOrderSigning.primaryType, "Order");
+  assert.equal(config.privateKey, undefined);
+  assert.equal(config.operatorApiKey, undefined);
+  await app.close();
 });
 
 test("signed order submission rejects missing balance or approval before signature validation", async () => {
@@ -257,6 +284,152 @@ test("football live lock rules close determined in-play markets", () => {
   );
 });
 
+test("settlement worker defers far scheduled fixtures and throttles near-kickoff fallback checks", async () => {
+  const store = new InMemoryStore();
+  const registry = new SourceRegistry();
+  let resultChecks = 0;
+  registry.register({
+    provider: "test",
+    listFixtures: async () => [],
+    listLiveFixtures: async () => [],
+    getFixtureResult: async (externalFixtureId) => {
+      resultChecks += 1;
+      return {
+        fixtureId: `test:${externalFixtureId}`,
+        source: { provider: "test", externalFixtureId },
+        status: "scheduled",
+        observedAt: "2026-05-21T00:00:00.000Z"
+      };
+    }
+  });
+
+  const farFixture = footballFixture("far", new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString());
+  store.upsertFixture(farFixture);
+  store.upsertMarkets(createFootballFixtureMarkets(farFixture, { status: "open" }));
+  const worker = createSettlementWorker({
+    store,
+    sourceRegistry: registry,
+    nearKickoffWindowMinutes: 180,
+    nearKickoffFallbackIntervalSeconds: 300
+  });
+
+  const farRun = await worker.runOnce();
+  assert.equal(resultChecks, 0);
+  assert.equal(farRun.checkedFixtures, 0);
+  assert.equal(farRun.deferredScheduledMarkets, 12);
+
+  const nearFixture = footballFixture("near", new Date(Date.now() + 30 * 60 * 1000).toISOString());
+  store.upsertFixture(nearFixture);
+  store.upsertMarkets(createFootballFixtureMarkets(nearFixture, { status: "open" }));
+  const firstNearRun = await worker.runOnce();
+  const secondNearRun = await worker.runOnce();
+
+  assert.equal(resultChecks, 1);
+  assert.equal(firstNearRun.scheduledFallbackChecks, 1);
+  assert.equal(secondNearRun.scheduledFallbackChecks, 0);
+  assert.equal(secondNearRun.deferredScheduledMarkets, 24);
+});
+
+test("API-Football player candidate cache reuses team rankings across fixture requests", async () => {
+  const originalFetch = globalThis.fetch;
+  const paths: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    paths.push(`${url.pathname}?${url.searchParams.toString()}`);
+
+    if (url.pathname === "/fixtures") {
+      return jsonResponse([apiFootballFixture()]);
+    }
+
+    if (url.pathname === "/players") {
+      return jsonResponse([apiFootballPlayer(Number(url.searchParams.get("team")) || 10)]);
+    }
+
+    throw new Error(`Unexpected API-Football test path: ${url.pathname}`);
+  };
+
+  try {
+    const store = new InMemoryStore();
+    const source = new ApiFootballSource("test-key", "https://football.test");
+    const first = await source.listPlayerCandidates({
+      externalFixtureId: "88",
+      limitPerTeam: 1,
+      cache: store
+    });
+    const second = await source.listPlayerCandidates({
+      externalFixtureId: "89",
+      limitPerTeam: 1,
+      cache: store
+    });
+
+    assert.equal(first.length, 2);
+    assert.equal(second.length, 2);
+    assert.equal(paths.filter((path) => path.startsWith("/players?")).length, 2);
+    assert.equal(store.playerCandidates.size, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("API-MMA maps UFC fights into fighter winner markets and results", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/fights") {
+      return jsonResponse([apiMmaFight()]);
+    }
+    throw new Error(`Unexpected API-MMA test path: ${url.pathname}`);
+  };
+
+  try {
+    const source = new ApiMmaSource("test-key", "https://mma.test", "UFC");
+    const [fixture] = await source.listFixtures({ sport: "mma", from: "2026-06-20" });
+    assert.ok(fixture);
+    assert.equal(fixture.id, "api-mma:700");
+    assert.equal(fixture.competition?.name, "UFC 330");
+    assert.equal(fixture.homeCompetitor, "Fighter Red");
+    assert.equal(fixture.awayCompetitor, "Fighter Blue");
+
+    const markets = createMmaFixtureMarkets(fixture, { status: "open" });
+    assert.deepEqual(markets.map((market) => market.id), [
+      "api-mma:700:home-team-win",
+      "api-mma:700:away-team-win"
+    ]);
+
+    const result = await source.getFixtureResult("700");
+    assert.deepEqual(result.score, { homeGoals: 1, awayGoals: 0 });
+    assert.equal(computeResolutionDecision(markets[0]!, result).outcome, "YES");
+    assert.equal(computeResolutionDecision(markets[1]!, result).outcome, "NO");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("MMA winner markets void a finished fight without one fighter winner", () => {
+  const fixture = {
+    id: "api-mma:draw",
+    sport: "mma" as const,
+    source: { provider: "api-mma", externalFixtureId: "draw" },
+    homeCompetitor: "Fighter One",
+    awayCompetitor: "Fighter Two",
+    kickoffTime: "2026-06-20T22:00:00.000Z",
+    status: "finished" as const
+  };
+  const [market] = createMmaFixtureMarkets(fixture);
+  assert.ok(market);
+
+  const decision = computeResolutionDecision(market, {
+    fixtureId: fixture.id,
+    source: fixture.source,
+    status: "finished",
+    score: { homeGoals: 0, awayGoals: 0 },
+    observedAt: "2026-06-20T23:00:00.000Z"
+  });
+
+  assert.equal(decision.outcome, "VOID");
+  assert.deepEqual(decision.payoutVector, [1, 1]);
+});
+
 test("orderbook aggregates open levels and excludes filled orders", () => {
   const bids = [
     storedOrder({ id: "bid-a", side: "BUY", makerAmount: "50", takerAmount: "100", remainingMaker: "50" }),
@@ -346,7 +519,7 @@ test("fill bookkeeping records trades and partial or full order remaining sizes"
   assert.equal(store.listClobFills().length, 2);
 });
 
-test("matcher and operator endpoints are protected", async () => {
+test("operator and market mutation endpoints are protected", async () => {
   const app = await testApp(marketStore(), {
     getMarketOnChain: async () => storedMarket(),
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
@@ -357,10 +530,297 @@ test("matcher and operator endpoints are protected", async () => {
 
   const match = await app.inject({ method: "POST", url: "/clob/matches", payload: {} });
   const tick = await app.inject({ method: "POST", url: "/clob/matcher/tick", payload: {} });
+  const transactions = await app.inject({ method: "GET", url: "/operator/transactions" });
+  const retry = await app.inject({
+    method: "POST",
+    url: "/operator/transactions/retry-resolution/retry-resolution"
+  });
+  const sync = await app.inject({ method: "POST", url: "/sync/current" });
+  const settlement = await app.inject({ method: "POST", url: "/settlement/tick" });
+  const persistedSourceFixtures = await app.inject({
+    method: "GET",
+    url: "/sources/test/fixtures?persist=true"
+  });
+  const sourceMarketCreation = await app.inject({
+    method: "GET",
+    url: "/sources/test/fixtures/current?createMarkets=true"
+  });
+  const fixture = await app.inject({ method: "POST", url: "/fixtures", payload: {} });
+  const generatedMarkets = await app.inject({
+    method: "POST",
+    url: "/fixtures/fixture-1/markets",
+    payload: {}
+  });
+  const yesNo = await app.inject({ method: "POST", url: "/markets/yes-no", payload: {} });
+  const createOnChain = await app.inject({
+    method: "POST",
+    url: "/markets/market-1/create-on-chain",
+    payload: {}
+  });
+  const resolve = await app.inject({
+    method: "POST",
+    url: "/markets/market-1/resolve",
+    payload: {}
+  });
+  const review = await app.inject({
+    method: "POST",
+    url: "/markets/market-1/review-resolution"
+  });
+  const submit = await app.inject({
+    method: "POST",
+    url: "/markets/market-1/submit-resolution",
+    payload: {}
+  });
 
-  assert.ok([401, 503].includes(match.statusCode));
-  assert.ok([401, 503].includes(tick.statusCode));
+  for (const response of [
+    match,
+    tick,
+    transactions,
+    retry,
+    sync,
+    settlement,
+    persistedSourceFixtures,
+    sourceMarketCreation,
+    fixture,
+    generatedMarkets,
+    yesNo,
+    createOnChain,
+    resolve,
+    review,
+    submit
+  ]) {
+    assert.ok([401, 503].includes(response.statusCode));
+  }
   await app.close();
+});
+
+test("resolution submission requires API review", async () => {
+  const originalApiKey = env.CLOB_OPERATOR_API_KEY;
+  env.CLOB_OPERATOR_API_KEY = "test-operator-api-key";
+
+  try {
+    const store = marketStore();
+    const market = store.getMarket("market-1");
+    assert.ok(market);
+    store.upsertResolution(computeResolutionDecision(market, {
+      fixtureId: "market-1",
+      source: { provider: "test" },
+      status: "finished",
+      explicitOutcome: "YES",
+      observedAt: "2026-05-21T00:00:00.000Z"
+    }));
+
+    const app = await testApp(store, readyClobChain());
+    const headers = { "x-operator-api-key": env.CLOB_OPERATOR_API_KEY };
+    const submitComputed = await app.inject({
+      method: "POST",
+      url: "/markets/market-1/submit-resolution",
+      headers,
+      payload: {}
+    });
+    const review = await app.inject({
+      method: "POST",
+      url: "/markets/market-1/review-resolution",
+      headers
+    });
+
+    assert.equal(submitComputed.statusCode, 409);
+    assert.equal(submitComputed.json().error, "Resolution must be reviewed before submission");
+    assert.equal(review.statusCode, 201);
+    assert.equal(review.json().status, "reviewed");
+    assert.equal(store.getResolution("market-1")?.status, "reviewed");
+    await app.close();
+  } finally {
+    env.CLOB_OPERATOR_API_KEY = originalApiKey;
+  }
+});
+
+test("operator transaction ledger records pending confirmation and failures", async () => {
+  const store = new InMemoryStore();
+  const result = await runTrackedOperatorTransaction(store, {
+    action: "SUBMIT_RESOLUTION",
+    entityId: "market-1",
+    metadata: { marketId: "market-1" },
+    execute: async (onSubmitted) => {
+      onSubmitted(transactionHash);
+      return "confirmed";
+    }
+  });
+
+  assert.equal(result, "confirmed");
+  const confirmed = store.listOperatorTransactions()[0];
+  assert.equal(confirmed?.status, "confirmed");
+  assert.equal(confirmed?.txHash, transactionHash);
+  assert.ok(confirmed?.submittedAt);
+  assert.ok(confirmed?.confirmedAt);
+
+  await assert.rejects(
+    runTrackedOperatorTransaction(store, {
+      action: "CREATE_MARKET",
+      entityId: "broken-market",
+      execute: async () => {
+        throw new Error("rpc failed");
+      }
+    }),
+    /rpc failed/
+  );
+  const failed = store.listOperatorTransactions({ action: "CREATE_MARKET" })[0];
+  assert.equal(failed?.status, "failed");
+  assert.equal(failed?.error, "rpc failed");
+  assert.ok(failed?.failedAt);
+});
+
+test("operator retry policy keeps broadcast errors recoverable and gates resolution resubmits", async () => {
+  const store = new InMemoryStore();
+  await assert.rejects(
+    runTrackedOperatorTransaction(store, {
+      action: "MATCH_ORDERS",
+      entityId: "match-after-hash",
+      execute: async (onSubmitted) => {
+        onSubmitted(transactionHash);
+        throw new Error("receipt polling timed out");
+      }
+    }),
+    /receipt polling timed out/
+  );
+
+  const broadcast = store.listOperatorTransactions({ action: "MATCH_ORDERS" })[0];
+  assert.equal(broadcast?.status, "pending");
+  assert.equal(broadcast?.txHash, transactionHash);
+  assert.equal(operatorTransactionRetryPolicy(broadcast!).disposition, "wait_for_recovery");
+
+  const failedResolution = store.upsertOperatorTransaction({
+    id: "resolution-before-hash",
+    action: "SUBMIT_RESOLUTION",
+    entityId: "market-1",
+    status: "failed",
+    error: "rpc unavailable"
+  });
+  const retryPolicy = operatorTransactionRetryPolicy(failedResolution);
+  assert.equal(retryPolicy.disposition, "manual_resolution_retry");
+  assert.equal(retryPolicy.retryable, true);
+
+  const revertedResolution = store.upsertOperatorTransaction({
+    ...failedResolution,
+    id: "resolution-reverted",
+    txHash: `0x${"d".repeat(64)}` as Hex
+  });
+  assert.equal(operatorTransactionRetryPolicy(revertedResolution).retryable, false);
+});
+
+test("operator recovery confirms pending receipts and reconciles market or resolution state", async () => {
+  const store = marketStore();
+  const market = store.getMarket("market-1");
+  assert.ok(market);
+  store.upsertResolution({
+    marketId: market.id,
+    marketType: "YES_NO",
+    outcome: "YES",
+    payoutVector: [0, 1],
+    status: "computed",
+    source: { provider: "test" },
+    observedAt: "2026-05-21T00:00:00.000Z",
+    computedAt: "2026-05-21T00:00:01.000Z",
+    reason: "test"
+  });
+  store.upsertOperatorTransaction({
+    id: "resolution-tx",
+    action: "SUBMIT_RESOLUTION",
+    entityId: market.id,
+    status: "pending",
+    txHash: transactionHash
+  });
+  store.upsertOperatorTransaction({
+    id: "market-tx",
+    action: "CREATE_MARKET",
+    entityId: market.id,
+    status: "pending",
+    txHash: `0x${"b".repeat(64)}` as Hex
+  });
+  store.upsertOperatorTransaction({
+    id: "revert-tx",
+    action: "MATCH_ORDERS",
+    entityId: "match-1",
+    status: "pending",
+    txHash: `0x${"c".repeat(64)}` as Hex
+  });
+  const worker = createOperatorTransactionRecoveryWorker({
+    store,
+    chain: {
+      getTransactionReceipt: async (hash) => receipt(hash === `0x${"c".repeat(64)}` ? "reverted" : "success"),
+      getMarketOnChain: async () => storedMarket()
+    }
+  });
+
+  const summary = await worker.runOnce();
+
+  assert.equal(summary.checked, 3);
+  assert.equal(summary.confirmed, 2);
+  assert.equal(summary.failed, 1);
+  assert.equal(summary.reconciledMarkets, 1);
+  assert.equal(summary.reconciledResolutions, 1);
+  assert.equal(store.getResolution(market.id)?.status, "submitted");
+  assert.equal(store.getMarket(market.id)?.conditionId, storedMarket().conditionId);
+  assert.equal(store.getOperatorTransaction("revert-tx")?.status, "failed");
+});
+
+test("operator recovery reconstructs a confirmed CLOB match once from saved match metadata", async () => {
+  const store = marketStore();
+  const taker = storedOrder({
+    id: "recover-buy",
+    side: "BUY",
+    makerAmount: "60",
+    takerAmount: "100",
+    remainingMaker: "60"
+  });
+  const makerOrder = storedOrder({
+    id: "recover-sell",
+    side: "SELL",
+    makerAmount: "40",
+    takerAmount: "24",
+    remainingMaker: "40",
+    maker: makerTwo
+  });
+  store.upsertClobOrder(taker);
+  store.upsertClobOrder(makerOrder);
+  store.upsertOperatorTransaction({
+    id: "recover-match",
+    action: "MATCH_ORDERS",
+    entityId: "recover-buy:recover-sell:24:40",
+    status: "pending",
+    txHash: transactionHash,
+    metadata: {
+      marketId: "market-1",
+      takerOrderId: taker.id,
+      makerOrderIds: [makerOrder.id],
+      takerFillAmount: "24",
+      makerFillAmounts: ["40"],
+      shareSize: "40"
+    }
+  });
+  const worker = createOperatorTransactionRecoveryWorker({
+    store,
+    chain: {
+      getTransactionReceipt: async () => receipt("success"),
+      getMarketOnChain: async () => storedMarket()
+    }
+  });
+
+  const first = await worker.runOnce();
+  const second = await worker.runOnce();
+  const recovered = store.getOperatorTransaction("recover-match")?.result as {
+    recoveredMatch?: { tradeId: string; orders: { id: string; status: string }[] };
+  };
+
+  assert.equal(first.recoveredMatches, 1);
+  assert.equal(first.recoveredTrades[0]?.txHash, transactionHash);
+  assert.equal(second.recoveredMatches, 0);
+  assert.equal(store.listClobTrades("market-1").length, 1);
+  assert.equal(store.listClobFills().length, 2);
+  assert.equal(store.getClobOrder(taker.id)?.remainingMaker, "36");
+  assert.equal(store.getClobOrder(makerOrder.id)?.status, "filled");
+  assert.ok(recovered.recoveredMatch?.tradeId);
+  assert.equal(recovered.recoveredMatch?.orders[1]?.status, "filled");
 });
 
 test("portfolio summarizes orders, fills, balances, and redeemable submitted positions", async () => {
@@ -416,6 +876,11 @@ test("portfolio summarizes orders, fills, balances, and redeemable submitted pos
   assert.equal(body.trades.length, 1);
   assert.equal(body.fills.length, 1);
   assert.equal(body.positions[0].outcomes[1].balance, "80");
+  assert.equal(body.positions[0].outcomes[1].averagePrice, "0.6");
+  assert.equal(body.positions[0].outcomes[1].currentPrice, "1");
+  assert.equal(body.positions[0].outcomes[1].costBasis, "48");
+  assert.equal(body.positions[0].outcomes[1].currentValue, "80");
+  assert.equal(body.positions[0].outcomes[1].unrealizedPnl, "32");
   assert.equal(body.positions[0].outcomes[1].redeemable, true);
   const redemption = await app.inject({
     method: "POST",
@@ -650,11 +1115,71 @@ test("market summary list and card feed batch frontend snippets", async () => {
   await app.close();
 });
 
+test("player future markets are discoverable and resolve from tournament aggregate stats", async () => {
+  const store = new InMemoryStore();
+  const market = createPlayerTournamentFutureMarket({
+    provider: "api-football",
+    competition: {
+      kind: "league",
+      id: "1",
+      name: "World Cup",
+      season: "2026"
+    },
+    playerId: "278",
+    playerName: "Kylian Mbappe",
+    teamName: "France",
+    imageUrl: "https://media.api-sports.io/football/players/278.png",
+    template: "TOURNAMENT_GOALS_OVER",
+    line: "4.5",
+    status: "open"
+  });
+  store.upsertMarket(market);
+
+  const decision = computeResolutionDecision(market, {
+    source: {
+      provider: "api-football",
+      externalFixtureId: "1"
+    },
+    fixtureId: "world-cup-2026",
+    status: "finished",
+    tournamentPlayerStats: [{
+      provider: "api-football",
+      playerId: "278",
+      playerName: "Kylian Mbappe",
+      goals: 5
+    }],
+    observedAt: "2026-07-20T00:00:00.000Z"
+  });
+
+  assert.equal(decision.outcome, "YES");
+  assert.deepEqual(decision.payoutVector, [0, 1]);
+  assert.match(decision.reason, /5 goals vs line 4.5/);
+
+  const app = await testApp(store, readyClobChain());
+  const cards = await app.inject({ method: "GET", url: "/markets/cards?category=player_future&competitionName=World%20Cup" });
+  assert.equal(cards.statusCode, 200);
+  assert.equal(cards.json().cards.length, 1);
+  assert.equal(cards.json().cards[0].type, "PLAYER_FUTURE");
+  assert.equal(cards.json().cards[0].player.playerName, "Kylian Mbappe");
+  assert.equal(cards.json().cards[0].competition.name, "World Cup");
+  await app.close();
+});
+
 async function testApp(store: InMemoryStore, clobChain: ClobRouteChain) {
   const app = Fastify({ logger: false });
   await registerRoutes(app, store, new SourceRegistry(), undefined, undefined, clobChain);
   await app.ready();
   return app;
+}
+
+function readyClobChain(): ClobRouteChain {
+  return {
+    getMarketOnChain: async () => storedMarket(),
+    getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
+    validateExchangeOrder: async () => transactionHash,
+    getAccountPortfolioBalances: async () => portfolioBalances(),
+    redemptionTransaction: async () => redeemTransaction()
+  };
 }
 
 function marketStore() {
@@ -672,6 +1197,68 @@ function storedMarket() {
     token1: "20",
     created: true
   };
+}
+
+function footballFixture(id: string, kickoffTime: string) {
+  return {
+    id: `test:${id}`,
+    sport: "football" as const,
+    source: { provider: "test", externalFixtureId: id },
+    homeCompetitor: `${id} Home`,
+    awayCompetitor: `${id} Away`,
+    kickoffTime,
+    status: "scheduled" as const
+  };
+}
+
+function apiFootballFixture() {
+  return {
+    fixture: {
+      id: 88,
+      date: "2026-06-11T19:00:00.000Z",
+      timestamp: Math.floor(Date.parse("2026-06-11T19:00:00.000Z") / 1000),
+      status: { short: "NS" }
+    },
+    league: { id: 1, name: "World Cup", season: 2026 },
+    teams: {
+      home: { id: 10, name: "Home" },
+      away: { id: 11, name: "Away" }
+    },
+    goals: { home: null, away: null }
+  };
+}
+
+function apiFootballPlayer(teamId: number) {
+  return {
+    player: { id: teamId * 100, name: `Player ${teamId}` },
+    statistics: [{
+      team: { id: teamId, name: `Team ${teamId}` },
+      games: { appearances: 5, minutes: 450, position: "Attacker" },
+      shots: { on: 6 },
+      goals: { total: 3, assists: 1 }
+    }]
+  };
+}
+
+function apiMmaFight() {
+  return {
+    id: 700,
+    date: "2026-06-20T22:00:00.000Z",
+    status: { short: "FT" },
+    slug: "UFC 330",
+    category: "Lightweight",
+    fighters: {
+      first: { id: 1, name: "Fighter Red", winner: true },
+      second: { id: 2, name: "Fighter Blue", winner: false }
+    }
+  };
+}
+
+function jsonResponse(response: unknown[]) {
+  return new Response(JSON.stringify({ response, paging: { current: 1, total: 1 } }), {
+    status: 200,
+    headers: { "content-type": "application/json" }
+  });
 }
 
 function portfolioBalances() {
@@ -694,6 +1281,12 @@ function redeemTransaction() {
     to: ctf,
     data: `0x${"f".repeat(64)}` as Hex
   };
+}
+
+function receipt(status: "success" | "reverted") {
+  return {
+    status
+  } as Awaited<ReturnType<NonNullable<Parameters<typeof createOperatorTransactionRecoveryWorker>[0]["chain"]>["getTransactionReceipt"]>>;
 }
 
 function unreadyBuyReadiness(): ExchangeOrderReadiness {

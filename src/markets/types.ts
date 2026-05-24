@@ -1,6 +1,6 @@
 export type MarketType = "YES_NO" | "TOTAL_GOALS" | "BOTH_TEAMS_TO_SCORE";
 
-export type Sport = "football" | "basketball" | "american_football" | "esports";
+export type Sport = "football" | "basketball" | "american_football" | "esports" | "mma";
 
 export type MarketStatus = "draft" | "open" | "closed" | "resolved" | "cancelled";
 export type MarketTradingStatus = "open" | "suspended" | "closed";
@@ -11,6 +11,12 @@ export type TotalGoalsLine = "0.5" | "1.5" | "2.5" | "3.5";
 
 export type PlayerMarketTemplate = "HAT_TRICK" | "YELLOW_CARD";
 export type MainCardPlayerMarketTemplate = "ANYTIME_GOALSCORER";
+export type PlayerTournamentFutureTemplate =
+  | "TOURNAMENT_GOALS_OVER"
+  | "TOURNAMENT_ASSISTS_OVER"
+  | "TOURNAMENT_CARDS_OVER"
+  | "TOURNAMENT_FOULS_OVER"
+  | "TOURNAMENT_FREE_KICK_GOAL";
 
 export type OutcomeSide = "NO" | "YES" | "UNDER" | "OVER";
 
@@ -44,6 +50,10 @@ export type BasketballFixture = Fixture & {
   sport: "basketball";
 };
 
+export type MmaFixture = Fixture & {
+  sport: "mma";
+};
+
 export type AmericanFootballFixture = Fixture & {
   sport: "american_football";
 };
@@ -66,6 +76,21 @@ export type PlayerIdentity = {
   playerId?: string | undefined;
   playerName: string;
   teamSide?: TeamSide | undefined;
+  teamName?: string | undefined;
+  imageUrl?: string | undefined;
+};
+
+export type TournamentPlayerStat = {
+  provider: string;
+  playerId?: string | undefined;
+  playerName: string;
+  goals?: number | undefined;
+  assists?: number | undefined;
+  cards?: number | undefined;
+  yellowCards?: number | undefined;
+  redCards?: number | undefined;
+  foulsCommitted?: number | undefined;
+  freeKickGoals?: number | undefined;
 };
 
 export type OutcomeDefinition = {
@@ -134,6 +159,13 @@ export type MarketTemplateRef =
       player: PlayerIdentity;
     }
   | {
+      category: "PLAYER_FUTURE";
+      template: PlayerTournamentFutureTemplate;
+      player: PlayerIdentity;
+      competition: CompetitionRef;
+      line?: string | undefined;
+    }
+  | {
       category: "MAIN" | "FIRST_HALF" | "TOTALS" | "BOTH_TEAMS_TO_SCORE";
     };
 
@@ -146,6 +178,7 @@ export type ResolverRule =
   | "FIRST_HALF_AWAY_TEAM_WIN"
   | "HOME_TEAM_SCORE_FIRST"
   | "PLAYER_SCORED"
+  | "PLAYER_TOURNAMENT_STAT"
   | "TOTAL_GOALS"
   | "BOTH_TEAMS_TO_SCORE"
   | "EXPLICIT_YES_NO";
@@ -164,6 +197,7 @@ export type ProviderFixtureResult = {
   homeTeamScoredFirst?: boolean | undefined;
   scoringPlayers?: PlayerIdentity[] | undefined;
   scoringPlayerNames?: string[] | undefined;
+  tournamentPlayerStats?: TournamentPlayerStat[] | undefined;
   explicitOutcome?: "NO" | "YES" | undefined;
   observedAt: string;
 };

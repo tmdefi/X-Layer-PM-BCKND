@@ -166,8 +166,8 @@ export class ApiFootballSource implements MarketDataSource {
 
     const limitPerTeam = query.limitPerTeam ?? 3;
     const [homeCandidates, awayCandidates] = await Promise.all([
-      this.teamPlayerCandidates(fixture, fixture.teams.home.id, "home", limitPerTeam),
-      this.teamPlayerCandidates(fixture, fixture.teams.away.id, "away", limitPerTeam)
+      this.teamPlayerCandidates(fixture, fixture.teams.home.id, "home", limitPerTeam, query.cache),
+      this.teamPlayerCandidates(fixture, fixture.teams.away.id, "away", limitPerTeam, query.cache)
     ]);
 
     return [...homeCandidates, ...awayCandidates].sort((a, b) => b.score - a.score);
@@ -293,8 +293,15 @@ export class ApiFootballSource implements MarketDataSource {
     fixture: ApiFootballFixture,
     teamId: number,
     teamSide: PlayerIdentity["teamSide"],
-    limit: number
+    limit: number,
+    cache?: PlayerCandidateQuery["cache"]
   ): Promise<PlayerCandidate[]> {
+    const cacheKey = playerCandidateCacheKey(fixture, teamId);
+    const cached = cache?.getPlayerCandidates(cacheKey);
+    if (cached) {
+      return withTeamSide(cached.candidates, teamSide).slice(0, limit);
+    }
+
     const players = await this.allPlayerStats(
       new URLSearchParams({
         team: String(teamId),
@@ -307,12 +314,13 @@ export class ApiFootballSource implements MarketDataSource {
         ? players
         : await this.topScorersForTeam(fixture, teamId);
 
-    return rankedSource
+    const candidates = rankedSource
       .map((entry) => this.toPlayerCandidate(entry, teamSide))
       .filter(isPlayerCandidate)
       .filter((candidate) => isScorerCandidate(candidate))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit);
+      .sort((a, b) => b.score - a.score);
+    cache?.upsertPlayerCandidates(cacheKey, candidates, playerCandidateCacheTtlMs(fixture));
+    return candidates.slice(0, limit);
   }
 
   private async topScorersForTeam(
@@ -563,6 +571,30 @@ function isScorerCandidate(candidate: PlayerCandidate): boolean {
   if (candidate.stats.minutes < 90) return false;
   if (position === "defender" && candidate.stats.goals < 2) return false;
   return candidate.score > 0;
+}
+
+function playerCandidateCacheKey(fixture: ApiFootballFixture, teamId: number): string {
+  const season = env.API_FOOTBALL_PLAYER_STATS_SEASON || fixture.league.season;
+  return `api-football:players:${fixture.league.id}:${season}:${teamId}`;
+}
+
+function playerCandidateCacheTtlMs(fixture: ApiFootballFixture): number {
+  const kickoff = fixture.fixture.timestamp * 1000;
+  const nearKickoffWindow = env.PLAYER_CANDIDATE_CACHE_NEAR_KICKOFF_WINDOW_MINUTES * 60 * 1000;
+  const nearKickoff = nearKickoffWindow > 0 && Math.abs(kickoff - Date.now()) <= nearKickoffWindow;
+  return (nearKickoff
+    ? env.PLAYER_CANDIDATE_CACHE_NEAR_KICKOFF_SECONDS
+    : env.PLAYER_CANDIDATE_CACHE_SCHEDULED_SECONDS) * 1000;
+}
+
+function withTeamSide(candidates: PlayerCandidate[], teamSide: PlayerIdentity["teamSide"]): PlayerCandidate[] {
+  return candidates.map((candidate) => ({
+    ...candidate,
+    player: {
+      ...candidate.player,
+      teamSide
+    }
+  }));
 }
 
 function summarizeHeadToHead(

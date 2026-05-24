@@ -3,12 +3,16 @@ import type {
   BothTeamsToScoreMarketDefinition,
   BasketballFixture,
   DataSourceRef,
+  EsportsFixture,
   Fixture,
   FootballFixture,
   MarketStatus,
   MainCardPlayerMarketTemplate,
+  MmaFixture,
+  CompetitionRef,
   PlayerIdentity,
   PlayerMarketTemplate,
+  PlayerTournamentFutureTemplate,
   ResolverConfig,
   TotalGoalsLine,
   TotalGoalsMarketDefinition,
@@ -44,6 +48,44 @@ export const MAIN_CARD_PLAYER_MARKET_TEMPLATES = [
   template: MainCardPlayerMarketTemplate;
   label: string;
   title: (playerName: string) => string;
+}[];
+
+export const PLAYER_TOURNAMENT_FUTURE_TEMPLATES = [
+  {
+    template: "TOURNAMENT_GOALS_OVER",
+    label: "Tournament Goals Over",
+    requiresLine: true,
+    title: (playerName: string, line?: string) => `${playerName} tournament goals over ${line}`
+  },
+  {
+    template: "TOURNAMENT_ASSISTS_OVER",
+    label: "Tournament Assists Over",
+    requiresLine: true,
+    title: (playerName: string, line?: string) => `${playerName} tournament assists over ${line}`
+  },
+  {
+    template: "TOURNAMENT_CARDS_OVER",
+    label: "Tournament Cards Over",
+    requiresLine: true,
+    title: (playerName: string, line?: string) => `${playerName} tournament cards over ${line}`
+  },
+  {
+    template: "TOURNAMENT_FOULS_OVER",
+    label: "Tournament Fouls Over",
+    requiresLine: true,
+    title: (playerName: string, line?: string) => `${playerName} tournament fouls committed over ${line}`
+  },
+  {
+    template: "TOURNAMENT_FREE_KICK_GOAL",
+    label: "To Score From a Free Kick",
+    requiresLine: false,
+    title: (playerName: string) => `${playerName} to score from a free kick`
+  }
+] as const satisfies readonly {
+  template: PlayerTournamentFutureTemplate;
+  label: string;
+  requiresLine: boolean;
+  title: (playerName: string, line?: string) => string;
 }[];
 
 type CreateFixtureMarketsOptions = {
@@ -122,7 +164,7 @@ export function createBothTeamsToScoreMarket(
 }
 
 export function createHomeTeamWinMarket(
-  fixture: FootballFixture,
+  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture,
   status: MarketStatus = "draft"
 ): YesNoMarketDefinition {
   return createYesNoMarket({
@@ -158,7 +200,7 @@ export function createDrawMarket(
 }
 
 export function createAwayTeamWinMarket(
-  fixture: FootballFixture | BasketballFixture,
+  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture,
   status: MarketStatus = "draft"
 ): YesNoMarketDefinition {
   return createYesNoMarket({
@@ -267,6 +309,24 @@ export function createBasketballFixtureMarkets(fixture: BasketballFixture, optio
   ];
 }
 
+export function createMmaFixtureMarkets(fixture: MmaFixture, options: CreateFixtureMarketsOptions = {}) {
+  const status = options.status ?? "draft";
+
+  return [
+    createHomeTeamWinMarket(fixture, status),
+    createAwayTeamWinMarket(fixture, status)
+  ];
+}
+
+export function createEsportsFixtureMarkets(fixture: EsportsFixture, options: CreateFixtureMarketsOptions = {}) {
+  const status = options.status ?? "draft";
+
+  return [
+    createHomeTeamWinMarket(fixture, status),
+    createAwayTeamWinMarket(fixture, status)
+  ];
+}
+
 export function createPlayerMarket(input: {
   fixture: FootballFixture;
   playerId?: string | undefined;
@@ -335,6 +395,58 @@ export function createMainCardPlayerMarket(input: {
   });
 }
 
+export function createPlayerTournamentFutureMarket(input: {
+  provider: string;
+  competition: CompetitionRef;
+  playerId?: string | undefined;
+  playerName: string;
+  teamName?: string | undefined;
+  imageUrl?: string | undefined;
+  template: PlayerTournamentFutureTemplate;
+  line?: string | undefined;
+  status?: MarketStatus | undefined;
+}): YesNoMarketDefinition {
+  const template = playerTournamentFutureTemplate(input.template);
+  if (template.requiresLine && !input.line) {
+    throw new Error(`Tournament future template ${input.template} requires a line`);
+  }
+  const playerSlug = slugify(input.playerName);
+  const templateSlug = input.template.toLowerCase().replaceAll("_", "-");
+  const competitionSlug = slugify(`${input.competition.name}-${input.competition.season ?? input.competition.id ?? ""}`);
+  const lineSlug = input.line ? `:${input.line}` : "";
+  const source: DataSourceRef = {
+    provider: input.provider,
+    ...(input.competition.id ? { externalFixtureId: input.competition.id } : {}),
+    externalMarketId: `player-future:${competitionSlug}:${playerSlug}:${templateSlug}${lineSlug}`,
+    fetchedAt: new Date().toISOString()
+  };
+  const player: PlayerIdentity = {
+    provider: input.provider,
+    playerName: input.playerName,
+    ...(input.playerId ? { playerId: input.playerId } : {}),
+    ...(input.teamName ? { teamName: input.teamName } : {}),
+    ...(input.imageUrl ? { imageUrl: input.imageUrl } : {})
+  };
+
+  return createYesNoMarket({
+    id: `${input.provider}:${competitionSlug}:player-future:${playerSlug}:${templateSlug}${lineSlug}`,
+    title: template.title(input.playerName, input.line),
+    status: input.status,
+    source,
+    resolver: {
+      rule: "PLAYER_TOURNAMENT_STAT",
+      source
+    },
+    template: {
+      category: "PLAYER_FUTURE",
+      template: input.template,
+      player,
+      competition: input.competition,
+      ...(input.line ? { line: input.line } : {})
+    }
+  });
+}
+
 export function createFootballFixtureMarkets(fixture: FootballFixture, options: CreateFixtureMarketsOptions = {}) {
   assertFootballFixture(fixture, "football fixture markets");
 
@@ -373,6 +485,15 @@ function mainCardPlayerMarketTemplate(template: MainCardPlayerMarketTemplate) {
   const found = MAIN_CARD_PLAYER_MARKET_TEMPLATES.find((candidate) => candidate.template === template);
   if (!found) {
     throw new Error(`Unsupported main-card player market template: ${template}`);
+  }
+
+  return found;
+}
+
+function playerTournamentFutureTemplate(template: PlayerTournamentFutureTemplate) {
+  const found = PLAYER_TOURNAMENT_FUTURE_TEMPLATES.find((candidate) => candidate.template === template);
+  if (!found) {
+    throw new Error(`Unsupported player tournament future template: ${template}`);
   }
 
   return found;

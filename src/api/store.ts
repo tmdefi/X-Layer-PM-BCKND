@@ -3,12 +3,19 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { randomUUID } from "node:crypto";
 import { env } from "../config/env.js";
 import type { Fixture, MarketDefinition, ResolutionDecision } from "../markets/types.js";
-import type { FixtureInsights } from "../sources/types.js";
+import type { FixtureInsights, PlayerCandidate } from "../sources/types.js";
 import type { StoredClobFill, StoredClobOrder, StoredClobTrade } from "../trading/types.js";
 import { MarketEventHub, type MarketRealtimeEventInput } from "./market-events.js";
+import type { OperatorTransaction, OperatorTransactionInput } from "./operator-transactions.js";
 
 export type FixtureInsightsCacheEntry = {
   insights: FixtureInsights;
+  cachedAt: string;
+  expiresAt: string;
+};
+
+export type PlayerCandidateCacheEntry = {
+  candidates: PlayerCandidate[];
   cachedAt: string;
   expiresAt: string;
 };
@@ -33,7 +40,9 @@ export class InMemoryStore {
   readonly markets = new Map<string, MarketDefinition>();
   readonly resolutions = new Map<string, ResolutionDecision>();
   readonly fixtureInsights = new Map<string, FixtureInsightsCacheEntry>();
+  readonly playerCandidates = new Map<string, PlayerCandidateCacheEntry>();
   readonly providerSyncLogs = new Map<string, ProviderSyncLog>();
+  readonly operatorTransactions = new Map<string, OperatorTransaction>();
   readonly clobOrders = new Map<string, StoredClobOrder>();
   readonly clobFills = new Map<string, StoredClobFill>();
   readonly clobTrades = new Map<string, StoredClobTrade>();
@@ -182,6 +191,33 @@ export class InMemoryStore {
     return entry;
   }
 
+  getPlayerCandidates(cacheKey: string, now = new Date()): PlayerCandidateCacheEntry | undefined {
+    const entry = this.playerCandidates.get(cacheKey);
+    if (!entry) return undefined;
+
+    if (Date.parse(entry.expiresAt) <= now.getTime()) {
+      this.playerCandidates.delete(cacheKey);
+      return undefined;
+    }
+
+    return entry;
+  }
+
+  upsertPlayerCandidates(
+    cacheKey: string,
+    candidates: PlayerCandidate[],
+    ttlMs: number,
+    now = new Date()
+  ): PlayerCandidateCacheEntry {
+    const entry = {
+      candidates,
+      cachedAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + ttlMs).toISOString()
+    };
+    this.playerCandidates.set(cacheKey, entry);
+    return entry;
+  }
+
   upsertProviderSyncLog(input: ProviderSyncLogInput): ProviderSyncLog {
     const log: ProviderSyncLog = {
       id: input.id ?? randomUUID(),
@@ -200,6 +236,45 @@ export class InMemoryStore {
     return [...this.providerSyncLogs.values()]
       .sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt))
       .slice(0, limit);
+  }
+
+  upsertOperatorTransaction(input: OperatorTransactionInput): OperatorTransaction {
+    const current = this.operatorTransactions.get(input.id);
+    const now = new Date().toISOString();
+    const transaction: OperatorTransaction = {
+      ...input,
+      createdAt: input.createdAt ?? current?.createdAt ?? now,
+      updatedAt: input.updatedAt ?? now
+    };
+    this.operatorTransactions.set(transaction.id, transaction);
+    return transaction;
+  }
+
+  getOperatorTransaction(id: string): OperatorTransaction | undefined {
+    return this.operatorTransactions.get(id);
+  }
+
+  listOperatorTransactions(input: {
+    status?: OperatorTransaction["status"] | undefined;
+    action?: OperatorTransaction["action"] | undefined;
+    entityId?: string | undefined;
+    limit?: number | undefined;
+  } = {}): OperatorTransaction[] {
+    return [...this.operatorTransactions.values()]
+      .filter((transaction) => !input.status || transaction.status === input.status)
+      .filter((transaction) => !input.action || transaction.action === input.action)
+      .filter((transaction) => !input.entityId || transaction.entityId === input.entityId)
+      .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+      .slice(0, input.limit ?? 100);
+  }
+
+  getActiveOperatorTransaction(
+    action: OperatorTransaction["action"],
+    entityId: string
+  ): OperatorTransaction | undefined {
+    return this.listOperatorTransactions({ action, entityId }).find((transaction) =>
+      transaction.status === "attempted" || transaction.status === "pending"
+    );
   }
 
   upsertClobOrder(order: StoredClobOrder): StoredClobOrder {
@@ -233,6 +308,12 @@ export class InMemoryStore {
     return [...this.clobTrades.values()]
       .filter((trade) => !marketId || trade.marketId === marketId)
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  }
+
+  getClobTradeByTransactionHash(transactionHash: StoredClobTrade["transactionHash"]): StoredClobTrade | undefined {
+    return [...this.clobTrades.values()].find((trade) =>
+      trade.transactionHash.toLowerCase() === transactionHash.toLowerCase()
+    );
   }
 
   listClobFills(orderId?: string): StoredClobFill[] {
@@ -273,13 +354,15 @@ export class PrismaBackedStore extends InMemoryStore {
   }
 
   async hydrate(): Promise<void> {
-    const [fixtures, markets, resolutions, fixtureInsights, providerSyncLogs, clobOrders, clobFills, clobTrades] =
+    const [fixtures, markets, resolutions, fixtureInsights, playerCandidates, providerSyncLogs, operatorTransactions, clobOrders, clobFills, clobTrades] =
       await Promise.all([
       this.prisma.fixture.findMany(),
       this.prisma.market.findMany(),
       this.prisma.resolution.findMany(),
       this.prisma.fixtureInsightsCache.findMany(),
+      this.prisma.playerCandidateCache.findMany(),
       this.prisma.providerSyncLog.findMany({ orderBy: { startedAt: "desc" }, take: 100 }),
+      this.prisma.operatorTransaction.findMany({ orderBy: { updatedAt: "desc" }, take: 500 }),
       this.prisma.clobOrder.findMany(),
       this.prisma.clobFill.findMany(),
       this.prisma.clobTrade.findMany({ include: { makerOrders: true } })
@@ -301,13 +384,14 @@ export class PrismaBackedStore extends InMemoryStore {
     }
 
     for (const market of markets) {
+      const fixedTradingStatus = fixStaleTradingStatus(market.status, market.tradingStatus as string | undefined);
       this.markets.set(market.id, {
         id: market.id,
         ...(market.fixtureId ? { fixtureId: market.fixtureId } : {}),
         type: market.type as MarketDefinition["type"],
         title: market.title,
         status: market.status as MarketDefinition["status"],
-        tradingStatus: market.tradingStatus as MarketDefinition["tradingStatus"],
+        tradingStatus: fixedTradingStatus ?? (market.tradingStatus as MarketDefinition["tradingStatus"]),
         ...(market.tradingStatusReason ? { tradingStatusReason: market.tradingStatusReason } : {}),
         ...(market.tradingStatusUpdatedAt ? { tradingStatusUpdatedAt: market.tradingStatusUpdatedAt.toISOString() } : {}),
         ...(market.source ? { source: market.source as MarketDefinition["source"] } : {}),
@@ -346,6 +430,15 @@ export class PrismaBackedStore extends InMemoryStore {
       });
     }
 
+    for (const entry of playerCandidates) {
+      if (entry.expiresAt.getTime() <= Date.now()) continue;
+      this.playerCandidates.set(entry.cacheKey, {
+        candidates: entry.candidates as unknown as PlayerCandidate[],
+        cachedAt: entry.cachedAt.toISOString(),
+        expiresAt: entry.expiresAt.toISOString()
+      });
+    }
+
     for (const log of providerSyncLogs) {
       this.providerSyncLogs.set(log.id, {
         id: log.id,
@@ -355,6 +448,24 @@ export class PrismaBackedStore extends InMemoryStore {
         startedAt: log.startedAt.toISOString(),
         ...(log.finishedAt ? { finishedAt: log.finishedAt.toISOString() } : {}),
         ...(log.details !== null ? { details: log.details } : {})
+      });
+    }
+
+    for (const transaction of operatorTransactions) {
+      this.operatorTransactions.set(transaction.id, {
+        id: transaction.id,
+        action: transaction.action as OperatorTransaction["action"],
+        entityId: transaction.entityId,
+        status: transaction.status as OperatorTransaction["status"],
+        ...(transaction.txHash ? { txHash: transaction.txHash as OperatorTransaction["txHash"] } : {}),
+        ...(transaction.metadata ? { metadata: transaction.metadata } : {}),
+        ...(transaction.result ? { result: transaction.result } : {}),
+        ...(transaction.error ? { error: transaction.error } : {}),
+        createdAt: transaction.createdAt.toISOString(),
+        updatedAt: transaction.updatedAt.toISOString(),
+        ...(transaction.submittedAt ? { submittedAt: transaction.submittedAt.toISOString() } : {}),
+        ...(transaction.confirmedAt ? { confirmedAt: transaction.confirmedAt.toISOString() } : {}),
+        ...(transaction.failedAt ? { failedAt: transaction.failedAt.toISOString() } : {})
       });
     }
 
@@ -526,6 +637,40 @@ export class PrismaBackedStore extends InMemoryStore {
     }));
 
     return entry;
+  }
+
+  override upsertPlayerCandidates(
+    cacheKey: string,
+    candidates: PlayerCandidate[],
+    ttlMs: number,
+    now = new Date()
+  ): PlayerCandidateCacheEntry {
+    const entry = super.upsertPlayerCandidates(cacheKey, candidates, ttlMs, now);
+    this.persist(this.prisma.playerCandidateCache.upsert({
+      where: { cacheKey },
+      create: {
+        cacheKey,
+        candidates: toJsonValue(entry.candidates),
+        cachedAt: new Date(entry.cachedAt),
+        expiresAt: new Date(entry.expiresAt)
+      },
+      update: {
+        candidates: toJsonValue(entry.candidates),
+        cachedAt: new Date(entry.cachedAt),
+        expiresAt: new Date(entry.expiresAt)
+      }
+    }));
+    return entry;
+  }
+
+  override upsertOperatorTransaction(input: OperatorTransactionInput): OperatorTransaction {
+    const transaction = super.upsertOperatorTransaction(input);
+    this.persist(this.prisma.operatorTransaction.upsert({
+      where: { id: transaction.id },
+      create: operatorTransactionToPrisma(transaction),
+      update: operatorTransactionToPrismaUpdate(transaction)
+    }));
+    return transaction;
   }
 
   override upsertProviderSyncLog(input: ProviderSyncLogInput): ProviderSyncLog {
@@ -719,6 +864,40 @@ function marketToPrismaUpdate(market: MarketDefinition): Prisma.MarketUpdateInpu
   };
 }
 
+function operatorTransactionToPrisma(transaction: OperatorTransaction): Prisma.OperatorTransactionCreateInput {
+  return {
+    id: transaction.id,
+    action: transaction.action,
+    entityId: transaction.entityId,
+    status: transaction.status,
+    txHash: transaction.txHash ?? null,
+    metadata: transaction.metadata !== undefined ? toJsonValue(transaction.metadata) : Prisma.DbNull,
+    result: transaction.result !== undefined ? toJsonValue(transaction.result) : Prisma.DbNull,
+    error: transaction.error ?? null,
+    submittedAt: transaction.submittedAt ? new Date(transaction.submittedAt) : null,
+    confirmedAt: transaction.confirmedAt ? new Date(transaction.confirmedAt) : null,
+    failedAt: transaction.failedAt ? new Date(transaction.failedAt) : null,
+    createdAt: new Date(transaction.createdAt),
+    updatedAt: new Date(transaction.updatedAt)
+  };
+}
+
+function operatorTransactionToPrismaUpdate(transaction: OperatorTransaction): Prisma.OperatorTransactionUpdateInput {
+  return {
+    action: transaction.action,
+    entityId: transaction.entityId,
+    status: transaction.status,
+    txHash: transaction.txHash ?? null,
+    metadata: transaction.metadata !== undefined ? toJsonValue(transaction.metadata) : Prisma.DbNull,
+    result: transaction.result !== undefined ? toJsonValue(transaction.result) : Prisma.DbNull,
+    error: transaction.error ?? null,
+    submittedAt: transaction.submittedAt ? new Date(transaction.submittedAt) : null,
+    confirmedAt: transaction.confirmedAt ? new Date(transaction.confirmedAt) : null,
+    failedAt: transaction.failedAt ? new Date(transaction.failedAt) : null,
+    updatedAt: new Date(transaction.updatedAt)
+  };
+}
+
 function marketShapeFields(market: MarketDefinition): { sport?: string; line?: string } {
   return {
     ...("sport" in market ? { sport: market.sport } : {}),
@@ -844,4 +1023,11 @@ function clobOrderToPrismaUpdate(order: StoredClobOrder): Prisma.ClobOrderUpdate
     status: order.status,
     updatedAt: new Date(order.updatedAt)
   };
+}
+
+function fixStaleTradingStatus(status: string, tradingStatus: string | undefined): string | undefined {
+  if (!tradingStatus) return undefined;
+  const isTerminal = status === "closed" || status === "resolved" || status === "cancelled";
+  if (!isTerminal && tradingStatus === "closed") return "open";
+  return undefined;
 }

@@ -155,7 +155,7 @@ function computeOutcome(market: MarketDefinition, result: ProviderFixtureResult)
         if (!result.score) {
           throw new Error(`Cannot resolve HOME_TEAM_WIN market ${market.id}: score is missing`);
         }
-        if (isBasketballWinnerMarket(market) && isTie(result.score)) {
+        if (isTieVoidWinnerMarket(market) && isTie(result.score)) {
           return "VOID";
         }
         return resolveHomeTeamWin(result.score);
@@ -172,7 +172,7 @@ function computeOutcome(market: MarketDefinition, result: ProviderFixtureResult)
         if (!result.score) {
           throw new Error(`Cannot resolve AWAY_TEAM_WIN market ${market.id}: score is missing`);
         }
-        if (isBasketballWinnerMarket(market) && isTie(result.score)) {
+        if (isTieVoidWinnerMarket(market) && isTie(result.score)) {
           return "VOID";
         }
         return resolveAwayTeamWin(result.score);
@@ -214,6 +214,17 @@ function computeOutcome(market: MarketDefinition, result: ProviderFixtureResult)
           throw new Error(`Cannot resolve PLAYER_SCORED market ${market.id}: scoring player list is missing`);
         }
         return playerScored(result, market.template.player) ? "YES" : "NO";
+      }
+
+      if (market.resolver?.rule === "PLAYER_TOURNAMENT_STAT") {
+        if (market.template?.category !== "PLAYER_FUTURE") {
+          throw new Error(`Cannot resolve PLAYER_TOURNAMENT_STAT market ${market.id}: player future template is missing`);
+        }
+        const stat = tournamentStatForPlayer(result, market.template.player);
+        if (!stat) {
+          throw new Error(`Cannot resolve PLAYER_TOURNAMENT_STAT market ${market.id}: tournament player stat is missing`);
+        }
+        return resolveTournamentPlayerFuture(market, stat) ? "YES" : "NO";
       }
 
       if (!result.explicitOutcome) {
@@ -306,7 +317,7 @@ function resolutionReason(
 
   if (market.type === "YES_NO" && market.resolver?.rule === "HOME_TEAM_WIN" && result.score) {
     if (outcome === "VOID") {
-      return `Final score ${result.score.homeGoals}-${result.score.awayGoals}: basketball tie voids home team win market`;
+      return `Final score ${result.score.homeGoals}-${result.score.awayGoals}: tied winner result voids home team win market`;
     }
     return `Final score ${result.score.homeGoals}-${result.score.awayGoals}: home team win ${outcome}`;
   }
@@ -317,7 +328,7 @@ function resolutionReason(
 
   if (market.type === "YES_NO" && market.resolver?.rule === "AWAY_TEAM_WIN" && result.score) {
     if (outcome === "VOID") {
-      return `Final score ${result.score.homeGoals}-${result.score.awayGoals}: basketball tie voids away team win market`;
+      return `Final score ${result.score.homeGoals}-${result.score.awayGoals}: tied winner result voids away team win market`;
     }
     return `Final score ${result.score.homeGoals}-${result.score.awayGoals}: away team win ${outcome}`;
   }
@@ -340,6 +351,11 @@ function resolutionReason(
 
   if (market.type === "YES_NO" && market.resolver?.rule === "PLAYER_SCORED" && market.template?.category === "MAIN_PLAYER") {
     return `Scoring players: ${scoringPlayerLabels(result)}; ${market.template.player.playerName} scored ${outcome}`;
+  }
+
+  if (market.type === "YES_NO" && market.resolver?.rule === "PLAYER_TOURNAMENT_STAT" && market.template?.category === "PLAYER_FUTURE") {
+    const stat = tournamentStatForPlayer(result, market.template.player);
+    return `Tournament player stat for ${market.template.player.playerName}: ${tournamentFutureStatLabel(market, stat)} => ${outcome}`;
   }
 
   return `Explicit oracle outcome: ${outcome}`;
@@ -370,10 +386,10 @@ function earlyResolutionReason(
   return `Irreversible live outcome: ${outcome}`;
 }
 
-function isBasketballWinnerMarket(market: MarketDefinition): boolean {
+function isTieVoidWinnerMarket(market: MarketDefinition): boolean {
   return (
     market.type === "YES_NO" &&
-    market.source?.provider === "highlightly" &&
+    (market.source?.provider === "highlightly" || market.source?.provider === "api-mma") &&
     (market.resolver?.rule === "HOME_TEAM_WIN" || market.resolver?.rule === "AWAY_TEAM_WIN")
   );
 }
@@ -397,6 +413,73 @@ function playerScoredWithStableIdentity(result: ProviderFixtureResult, player: P
     scorer.provider === player.provider &&
     scorer.playerId === player.playerId
   );
+}
+
+function tournamentStatForPlayer(result: ProviderFixtureResult, player: PlayerIdentity) {
+  const stats = result.tournamentPlayerStats ?? [];
+  if (player.playerId) {
+    const idMatch = stats.find((stat) => stat.provider === player.provider && stat.playerId === player.playerId);
+    if (idMatch) return idMatch;
+  }
+
+  const expected = normalizePlayerName(player.playerName);
+  return stats.find((stat) =>
+    stat.provider === player.provider &&
+    normalizePlayerName(stat.playerName) === expected
+  );
+}
+
+function resolveTournamentPlayerFuture(
+  market: MarketDefinition & { type: "YES_NO" },
+  stat: NonNullable<ProviderFixtureResult["tournamentPlayerStats"]>[number]
+): boolean {
+  if (market.template?.category !== "PLAYER_FUTURE") {
+    throw new Error(`Cannot resolve tournament player future ${market.id}: template is missing`);
+  }
+
+  switch (market.template.template) {
+    case "TOURNAMENT_GOALS_OVER":
+      return statValue(stat.goals) > futureLine(market);
+    case "TOURNAMENT_ASSISTS_OVER":
+      return statValue(stat.assists) > futureLine(market);
+    case "TOURNAMENT_CARDS_OVER":
+      return statValue(stat.cards ?? statValue(stat.yellowCards) + statValue(stat.redCards)) > futureLine(market);
+    case "TOURNAMENT_FOULS_OVER":
+      return statValue(stat.foulsCommitted) > futureLine(market);
+    case "TOURNAMENT_FREE_KICK_GOAL":
+      return statValue(stat.freeKickGoals) > 0;
+  }
+}
+
+function futureLine(market: MarketDefinition): number {
+  const line = market.template?.category === "PLAYER_FUTURE" ? Number(market.template.line) : NaN;
+  if (!Number.isFinite(line)) {
+    throw new Error(`Cannot resolve tournament player future ${market.id}: line is missing`);
+  }
+  return line;
+}
+
+function statValue(value: number | undefined): number {
+  return Number.isFinite(value) ? Number(value) : 0;
+}
+
+function tournamentFutureStatLabel(
+  market: MarketDefinition,
+  stat: NonNullable<ProviderFixtureResult["tournamentPlayerStats"]>[number] | undefined
+): string {
+  if (!stat || market.template?.category !== "PLAYER_FUTURE") return "missing";
+  switch (market.template.template) {
+    case "TOURNAMENT_GOALS_OVER":
+      return `${statValue(stat.goals)} goals vs line ${market.template.line}`;
+    case "TOURNAMENT_ASSISTS_OVER":
+      return `${statValue(stat.assists)} assists vs line ${market.template.line}`;
+    case "TOURNAMENT_CARDS_OVER":
+      return `${statValue(stat.cards ?? statValue(stat.yellowCards) + statValue(stat.redCards))} cards vs line ${market.template.line}`;
+    case "TOURNAMENT_FOULS_OVER":
+      return `${statValue(stat.foulsCommitted)} fouls committed vs line ${market.template.line}`;
+    case "TOURNAMENT_FREE_KICK_GOAL":
+      return `${statValue(stat.freeKickGoals)} free-kick goals`;
+  }
 }
 
 function normalizePlayerName(playerName: string): string {

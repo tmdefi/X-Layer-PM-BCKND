@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const sportSchema = z.enum(["football", "basketball", "american_football", "esports"]);
+export const sportSchema = z.enum(["football", "basketball", "american_football", "esports", "mma"]);
 
 export const fixtureStatusSchema = z.enum([
   "scheduled",
@@ -17,12 +17,21 @@ export const marketTypeSchema = z.enum(["YES_NO", "TOTAL_GOALS", "BOTH_TEAMS_TO_
 
 export const playerMarketTemplateSchema = z.enum(["HAT_TRICK", "YELLOW_CARD"]);
 export const mainCardPlayerMarketTemplateSchema = z.enum(["ANYTIME_GOALSCORER"]);
+export const playerTournamentFutureTemplateSchema = z.enum([
+  "TOURNAMENT_GOALS_OVER",
+  "TOURNAMENT_ASSISTS_OVER",
+  "TOURNAMENT_CARDS_OVER",
+  "TOURNAMENT_FOULS_OVER",
+  "TOURNAMENT_FREE_KICK_GOAL"
+]);
 export const teamSideSchema = z.enum(["home", "away"]);
 
 export const playerIdentityInputSchema = z.object({
   playerId: z.string().min(1).optional(),
   playerName: z.string().min(1),
-  teamSide: teamSideSchema.optional()
+  teamSide: teamSideSchema.optional(),
+  teamName: z.string().min(1).optional(),
+  imageUrl: z.string().url().optional()
 });
 
 export const dataSourceRefSchema = z.object({
@@ -70,6 +79,7 @@ export const createYesNoMarketSchema = z.object({
         "FIRST_HALF_AWAY_TEAM_WIN",
         "HOME_TEAM_SCORE_FIRST",
         "PLAYER_SCORED",
+        "PLAYER_TOURNAMENT_STAT",
         "EXPLICIT_YES_NO"
       ]),
       source: dataSourceRefSchema
@@ -116,6 +126,24 @@ export const autoMainCardPlayerMarketsSchema = z.object({
   limitPerTeam: z.coerce.number().int().min(1).max(5).default(3)
 });
 
+export const createPlayerTournamentFuturesSchema = z.object({
+  status: marketStatusSchema.optional(),
+  provider: z.string().min(1).default("api-football"),
+  competition: competitionRefSchema,
+  markets: z
+    .array(
+      z.object({
+        playerId: z.string().min(1).optional(),
+        playerName: z.string().min(1),
+        teamName: z.string().min(1).optional(),
+        imageUrl: z.string().url().optional(),
+        template: playerTournamentFutureTemplateSchema,
+        line: z.string().regex(/^\d+(?:\.\d+)?$/, "Expected numeric line").optional()
+      })
+    )
+    .min(1)
+});
+
 export const sourceFixtureQuerySchema = z.object({
   sport: sportSchema.optional(),
   from: z.string().date().optional(),
@@ -148,6 +176,18 @@ export const providerFixtureResultSchema = z.object({
   homeTeamScoredFirst: z.boolean().optional(),
   scoringPlayers: z.array(playerIdentityInputSchema.extend({ provider: z.string().min(1) })).optional(),
   scoringPlayerNames: z.array(z.string().min(1)).optional(),
+  tournamentPlayerStats: z.array(z.object({
+    provider: z.string().min(1),
+    playerId: z.string().min(1).optional(),
+    playerName: z.string().min(1),
+    goals: z.number().min(0).optional(),
+    assists: z.number().min(0).optional(),
+    cards: z.number().min(0).optional(),
+    yellowCards: z.number().min(0).optional(),
+    redCards: z.number().min(0).optional(),
+    foulsCommitted: z.number().min(0).optional(),
+    freeKickGoals: z.number().min(0).optional()
+  })).optional(),
   explicitOutcome: z.enum(["NO", "YES"]).optional(),
   observedAt: z.string().datetime()
 });
@@ -252,7 +292,7 @@ export const marketListQuerySchema = z.object({
   provider: z.string().trim().min(1).max(80).optional(),
   fixtureStatus: fixtureStatusSchema.optional(),
   marketType: marketTypeSchema.optional(),
-  category: z.enum(["match", "player", "main_player", "standalone"]).optional(),
+  category: z.enum(["match", "player", "main_player", "player_future", "standalone"]).optional(),
   competitionId: z.string().trim().min(1).max(120).optional(),
   competitionName: z.string().trim().min(1).max(160).optional(),
   sort: z.enum(["kickoff_time", "live_status", "volume", "newest_activity"]).default("kickoff_time"),

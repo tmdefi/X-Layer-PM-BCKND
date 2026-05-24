@@ -13,6 +13,7 @@ import type {
   ResolutionDecision
 } from "../markets/types.js";
 import type { InMemoryStore } from "../api/store.js";
+import { runTrackedOperatorTransaction } from "../api/operator-transactions.js";
 import type { SourceRegistry } from "../sources/index.js";
 
 type SettlementLogger = {
@@ -26,7 +27,15 @@ export type SettlementWorkerOptions = {
   sourceRegistry: SourceRegistry;
   intervalSeconds?: number | undefined;
   submitOnChain?: boolean | undefined;
+  nearKickoffWindowMinutes?: number | undefined;
+  nearKickoffFallbackIntervalSeconds?: number | undefined;
+  providerLimits?: Partial<Record<string, ProviderSettlementLimit>> | undefined;
   logger?: SettlementLogger | undefined;
+};
+
+type ProviderSettlementLimit = {
+  maxFixturesPerRun: number;
+  cooldownSeconds: number;
 };
 
 export type SettlementWorkerStatus = {
@@ -34,6 +43,9 @@ export type SettlementWorkerStatus = {
   running: boolean;
   intervalSeconds: number;
   submitOnChain: boolean;
+  nearKickoffWindowMinutes: number;
+  nearKickoffFallbackIntervalSeconds: number;
+  providerLimits: Record<string, ProviderSettlementLimit>;
   trackedLiveFixtures: number;
   lastRunStartedAt?: string | undefined;
   lastRunCompletedAt?: string | undefined;
@@ -48,8 +60,11 @@ export type SettlementRunSummary = {
   computedResolutions: number;
   closedLiveMarkets: number;
   earlyResolutions: number;
+  scheduledFallbackChecks: number;
+  deferredScheduledMarkets: number;
   submittedOnChain: number;
   skippedMarkets: number;
+  rateLimitedFixtures: number;
   errors: string[];
 };
 
@@ -66,16 +81,33 @@ export class SettlementWorker {
   private timer: NodeJS.Timeout | undefined;
   private running = false;
   private readonly liveFixtureKeys = new Set<string>();
+  private readonly scheduledFallbackChecks = new Map<string, number>();
+  private readonly providerLastCheckedAt = new Map<string, number>();
+  private readonly providerLastLiveListAt = new Map<string, number>();
   private lastRunStartedAt: string | undefined;
   private lastRunCompletedAt: string | undefined;
   private lastRun: SettlementRunSummary | undefined;
 
   readonly intervalSeconds: number;
   readonly submitOnChain: boolean;
+  readonly nearKickoffWindowMinutes: number;
+  readonly nearKickoffFallbackIntervalSeconds: number;
+  readonly providerLimits: Record<string, ProviderSettlementLimit>;
 
   constructor(private readonly options: SettlementWorkerOptions) {
     this.intervalSeconds = options.intervalSeconds ?? env.SETTLEMENT_POLL_INTERVAL_SECONDS;
     this.submitOnChain = options.submitOnChain ?? env.SETTLEMENT_SUBMIT_ON_CHAIN;
+    this.nearKickoffWindowMinutes =
+      options.nearKickoffWindowMinutes ?? env.SETTLEMENT_NEAR_KICKOFF_WINDOW_MINUTES;
+    this.nearKickoffFallbackIntervalSeconds =
+      options.nearKickoffFallbackIntervalSeconds ?? env.SETTLEMENT_NEAR_KICKOFF_FALLBACK_INTERVAL_SECONDS;
+    this.providerLimits = {
+      pandascore: {
+        maxFixturesPerRun: env.PANDASCORE_SETTLEMENT_MAX_FIXTURES_PER_RUN,
+        cooldownSeconds: env.PANDASCORE_SETTLEMENT_COOLDOWN_SECONDS
+      },
+      ...(options.providerLimits ?? {})
+    };
   }
 
   start(): void {
@@ -101,6 +133,9 @@ export class SettlementWorker {
       running: this.running,
       intervalSeconds: this.intervalSeconds,
       submitOnChain: this.submitOnChain,
+      nearKickoffWindowMinutes: this.nearKickoffWindowMinutes,
+      nearKickoffFallbackIntervalSeconds: this.nearKickoffFallbackIntervalSeconds,
+      providerLimits: this.providerLimits,
       trackedLiveFixtures: this.liveFixtureKeys.size,
       lastRunStartedAt: this.lastRunStartedAt,
       lastRunCompletedAt: this.lastRunCompletedAt,
@@ -118,8 +153,11 @@ export class SettlementWorker {
         computedResolutions: 0,
         closedLiveMarkets: 0,
         earlyResolutions: 0,
+        scheduledFallbackChecks: 0,
+        deferredScheduledMarkets: 0,
         submittedOnChain: 0,
         skippedMarkets: 0,
+        rateLimitedFixtures: 0,
         errors: ["Settlement worker is already running"]
       };
     }
@@ -135,13 +173,17 @@ export class SettlementWorker {
       computedResolutions: 0,
       closedLiveMarkets: 0,
       earlyResolutions: 0,
+      scheduledFallbackChecks: 0,
+      deferredScheduledMarkets: 0,
       submittedOnChain: 0,
       skippedMarkets: 0,
+      rateLimitedFixtures: 0,
       errors: []
     };
 
     try {
       const groups = this.marketGroups();
+      const providerChecks = this.providerCheckTracker();
       const currentLiveFixtureKeys = await this.refreshLiveFixtures(groups, summary);
       const transitionGroups = groups.filter(
         (group) => this.liveFixtureKeys.has(liveKey(group.provider, group.externalFixtureId)) &&
@@ -152,6 +194,7 @@ export class SettlementWorker {
       const transitionedKeys = new Set(transitionGroups.map((group) => groupKey(group)));
 
       for (const group of transitionGroups) {
+        if (!this.canCheckProviderGroup(group, providerChecks, summary)) continue;
         await this.settleGroup(group, summary);
       }
 
@@ -163,12 +206,16 @@ export class SettlementWorker {
       for (const group of groups) {
         if (transitionedKeys.has(groupKey(group))) continue;
         if (this.liveFixtureKeys.has(liveKey(group.provider, group.externalFixtureId))) {
+          if (!this.canCheckProviderGroup(group, providerChecks, summary)) continue;
           await this.applyLiveTradingRules(group, summary);
           summary.skippedMarkets += group.markets.length;
           continue;
         }
 
-        await this.settleGroup(group, summary);
+        if (this.shouldCheckNonLiveGroup(group, summary)) {
+          if (!this.canCheckProviderGroup(group, providerChecks, summary)) continue;
+          await this.settleGroup(group, summary);
+        }
       }
     } finally {
       this.running = false;
@@ -178,6 +225,40 @@ export class SettlementWorker {
     }
 
     return summary;
+  }
+
+  private providerCheckTracker(): Map<string, number> {
+    const tracker = new Map<string, number>();
+    const now = Date.now();
+
+    for (const [provider, limit] of Object.entries(this.providerLimits)) {
+      const lastCheckedAt = this.providerLastCheckedAt.get(provider);
+      if (lastCheckedAt && now - lastCheckedAt < limit.cooldownSeconds * 1000) {
+        tracker.set(provider, limit.maxFixturesPerRun);
+      }
+    }
+
+    return tracker;
+  }
+
+  private canCheckProviderGroup(
+    group: SettlementGroup,
+    providerChecks: Map<string, number>,
+    summary: SettlementRunSummary
+  ): boolean {
+    const limit = this.providerLimits[group.provider];
+    if (!limit) return true;
+
+    const checked = providerChecks.get(group.provider) ?? 0;
+    if (checked >= limit.maxFixturesPerRun) {
+      summary.rateLimitedFixtures += 1;
+      summary.deferredScheduledMarkets += group.markets.length;
+      return false;
+    }
+
+    providerChecks.set(group.provider, checked + 1);
+    this.providerLastCheckedAt.set(group.provider, Date.now());
+    return true;
   }
 
   private async settleMarket(
@@ -284,7 +365,22 @@ export class SettlementWorker {
     summary.computedResolutions += 1;
 
     if (this.submitOnChain && decision.outcome !== "VOID") {
-      await resolveMarketOnChain(hashIdentifier(market.id), outcomeSideToResolverOutcome(decision.outcome));
+      const questionId = hashIdentifier(market.id);
+      await runTrackedOperatorTransaction(this.options.store, {
+        action: "SUBMIT_RESOLUTION",
+        entityId: market.id,
+        metadata: {
+          marketId: market.id,
+          outcome: decision.outcome,
+          questionId,
+          earlyResolution: Boolean(decision.earlyResolution)
+        },
+        execute: (onSubmitted) => resolveMarketOnChain(
+          questionId,
+          outcomeSideToResolverOutcome(decision.outcome),
+          { onSubmitted }
+        )
+      });
       this.options.store.upsertResolution({
         ...decision,
         status: "submitted"
@@ -316,6 +412,7 @@ export class SettlementWorker {
       try {
         const source = this.options.sourceRegistry.get(provider);
         if (!source.listLiveFixtures) continue;
+        if (!this.canRefreshProviderLiveFixtures(provider)) continue;
 
         const fixtures = await source.listLiveFixtures();
 
@@ -340,6 +437,20 @@ export class SettlementWorker {
 
     summary.liveFixtures = liveKeys.size;
     return liveKeys;
+  }
+
+  private canRefreshProviderLiveFixtures(provider: string): boolean {
+    const limit = this.providerLimits[provider];
+    if (!limit) return true;
+
+    const now = Date.now();
+    const lastCheckedAt = this.providerLastLiveListAt.get(provider);
+    if (lastCheckedAt && now - lastCheckedAt < limit.cooldownSeconds * 1000) {
+      return false;
+    }
+
+    this.providerLastLiveListAt.set(provider, now);
+    return true;
   }
 
   private marketGroups(): SettlementGroup[] {
@@ -373,6 +484,53 @@ export class SettlementWorker {
     }
 
     return [...groups.values()];
+  }
+
+  private shouldCheckNonLiveGroup(group: SettlementGroup, summary: SettlementRunSummary): boolean {
+    const fixture = this.options.store.getFixture(group.fixtureId);
+    if (!fixture) {
+      summary.deferredScheduledMarkets += group.markets.length;
+      return false;
+    }
+
+    if (SETTLEMENT_STATUSES.includes(fixture.status) || fixture.status === "live") {
+      return true;
+    }
+
+    if (fixture.status !== "scheduled" || !this.isNearKickoff(fixture.kickoffTime)) {
+      summary.deferredScheduledMarkets += group.markets.length;
+      return false;
+    }
+
+    if (!this.canRunScheduledFallback(group)) {
+      summary.deferredScheduledMarkets += group.markets.length;
+      return false;
+    }
+
+    summary.scheduledFallbackChecks += 1;
+    return true;
+  }
+
+  private canRunScheduledFallback(group: SettlementGroup): boolean {
+    if (this.nearKickoffFallbackIntervalSeconds <= 0) return false;
+
+    const key = groupKey(group);
+    const now = Date.now();
+    const lastCheck = this.scheduledFallbackChecks.get(key);
+    if (lastCheck && now - lastCheck < this.nearKickoffFallbackIntervalSeconds * 1000) {
+      return false;
+    }
+
+    this.scheduledFallbackChecks.set(key, now);
+    return true;
+  }
+
+  private isNearKickoff(kickoffTime: string): boolean {
+    if (this.nearKickoffWindowMinutes <= 0) return false;
+
+    const kickoff = Date.parse(kickoffTime);
+    if (!Number.isFinite(kickoff)) return false;
+    return Math.abs(Date.now() - kickoff) <= this.nearKickoffWindowMinutes * 60 * 1000;
   }
 
   private logInfo(message: string, data: unknown): void {

@@ -15,36 +15,52 @@ import {
   prepareExchangeOrder,
   redemptionTransaction,
   resolveMarketOnChain,
-  validateExchangeOrder
+  validateExchangeOrder,
+  exchangeDomain,
+  xLayerChain
 } from "../chain/index.js";
 import { env } from "../config/env.js";
 import {
   MAIN_CARD_PLAYER_MARKET_TEMPLATES,
   PLAYER_MARKET_TEMPLATES,
+  PLAYER_TOURNAMENT_FUTURE_TEMPLATES,
   createBasketballFixtureMarkets,
+  createEsportsFixtureMarkets,
   createFootballFixtureMarkets,
+  createMmaFixtureMarkets,
   createMainCardPlayerMarket,
   createPlayerMarket,
+  createPlayerTournamentFutureMarket,
   createYesNoMarket
 } from "../markets/definitions.js";
 import { computeResolutionDecision } from "../markets/resolution.js";
+import { markResolutionReviewed } from "../resolution/index.js";
 import type {
   BasketballFixture,
+  EsportsFixture,
   Fixture,
   FixtureStatus,
   FootballFixture,
   MarketDefinition,
+  MmaFixture,
   ResolutionDecision
 } from "../markets/types.js";
 import type { FixtureInsights, FixtureQuery, SourceRegistry } from "../sources/index.js";
 import type { SettlementWorker } from "../settlement/index.js";
 import type { ProviderSyncWorker } from "../sync/index.js";
+import type { OperatorTransactionRecoveryWorker } from "../operator-recovery/index.js";
 import type { InMemoryStore } from "./store.js";
+import {
+  operatorTransactionRetryPolicy,
+  runTrackedOperatorTransaction
+} from "./operator-transactions.js";
 import { requireClobOperatorApiKey } from "./security.js";
 import {
   autoMatchOrder,
   buildOrderbook,
   executeMatchPlan,
+  fillWithHouseLiquidity,
+  tickHouseLiquidity,
   marketCandles,
   marketPriceData,
   marketSummaryData,
@@ -64,6 +80,7 @@ import {
   createMarketOnChainSchema,
   createMainCardPlayerMarketsSchema,
   createPlayerMarketsSchema,
+  createPlayerTournamentFuturesSchema,
   currentFixtureQuerySchema,
   createYesNoMarketSchema,
   fixtureSchema,
@@ -103,7 +120,8 @@ export async function registerRoutes(
   sourceRegistry: SourceRegistry,
   settlementWorker?: SettlementWorker,
   syncWorker?: ProviderSyncWorker,
-  clobChain: ClobRouteChain = defaultClobRouteChain
+  clobChain: ClobRouteChain = defaultClobRouteChain,
+  operatorRecoveryWorker?: OperatorTransactionRecoveryWorker
 ): Promise<void> {
   app.get("/events/markets", async (request, reply) => {
     reply.hijack();
@@ -140,8 +158,10 @@ export async function registerRoutes(
   }));
 
   app.get("/sports", async () => ({
-    sports: ["football", "basketball", "american_football", "esports"]
+    sports: ["football", "basketball", "american_football", "esports", "mma"]
   }));
+
+  app.get("/wallet/config", async () => walletConnectionConfig());
 
   app.get("/market-templates/player", async () => ({
     templates: PLAYER_MARKET_TEMPLATES.map(({ template, label }) => ({ template, label }))
@@ -149,6 +169,14 @@ export async function registerRoutes(
 
   app.get("/market-templates/main-card-player", async () => ({
     templates: MAIN_CARD_PLAYER_MARKET_TEMPLATES.map(({ template, label }) => ({ template, label }))
+  }));
+
+  app.get("/market-templates/player-future", async () => ({
+    templates: PLAYER_TOURNAMENT_FUTURE_TEMPLATES.map(({ template, label, requiresLine }) => ({
+      template,
+      label,
+      requiresLine
+    }))
   }));
 
   app.get("/sources", async () => ({
@@ -163,11 +191,107 @@ export async function registerRoutes(
     sync: syncWorker?.status()
   }));
 
+  app.get("/operator/recovery/status", async () => ({
+    recovery: operatorRecoveryWorker?.status()
+  }));
+
   app.get<{ Querystring: { limit?: string | undefined } }>("/sync/logs", async (request) => ({
     logs: store.listProviderSyncLogs(Number(request.query.limit ?? 50))
   }));
 
-  app.post<{ Params: { provider: string } }>("/sync/:provider/current", async (request, reply) => {
+  app.get<{ Querystring: {
+    status?: string | undefined;
+    action?: string | undefined;
+    entityId?: string | undefined;
+    limit?: string | undefined;
+  } }>("/operator/transactions", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request) => {
+    const status = operatorTransactionStatus(request.query.status);
+    const action = operatorTransactionAction(request.query.action);
+    return {
+      transactions: store.listOperatorTransactions({
+        ...(status ? { status } : {}),
+        ...(action ? { action } : {}),
+        ...(request.query.entityId ? { entityId: request.query.entityId } : {}),
+        limit: Number(request.query.limit ?? 100)
+      }).map((transaction) => ({
+        ...transaction,
+        retryPolicy: operatorTransactionRetryPolicy(transaction)
+      }))
+    };
+  });
+
+  app.post<{ Params: { id: string } }>("/operator/transactions/:id/retry-resolution", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
+    const transaction = store.getOperatorTransaction(request.params.id);
+    if (!transaction) {
+      return reply.code(404).send({ error: "Operator transaction not found" });
+    }
+
+    const retryPolicy = operatorTransactionRetryPolicy(transaction);
+    if (transaction.action !== "SUBMIT_RESOLUTION" || retryPolicy.disposition !== "manual_resolution_retry") {
+      return reply.code(409).send({
+        error: "Only no-hash failed resolution submissions can be retried from this route",
+        retryPolicy
+      });
+    }
+
+    const market = store.getMarket(transaction.entityId);
+    const decision = store.getResolution(transaction.entityId);
+    if (!market || !decision) {
+      return reply.code(409).send({
+        error: "The market and computed resolution must still exist before retrying submission",
+        retryPolicy
+      });
+    }
+    if (decision.outcome === "VOID") {
+      return reply.code(409).send({ error: "VOID resolutions require the void/refund resolver path" });
+    }
+    if (decision.status !== "reviewed") {
+      return reply.code(409).send({ error: "Resolution must be reviewed before submission" });
+    }
+
+    const questionId = resolutionQuestionId(transaction.metadata) ?? hashIdentifier(market.id);
+    const result = await submitResolutionOperatorTransaction(store, {
+      marketId: market.id,
+      outcome: decision.outcome,
+      questionId,
+      metadata: {
+        marketId: market.id,
+        outcome: decision.outcome,
+        questionId,
+        source: "operator_retry",
+        retryOf: transaction.id
+      }
+    });
+    const submittedDecision: ResolutionDecision = {
+      ...decision,
+      status: "submitted"
+    };
+    store.upsertResolution(submittedDecision);
+
+    return reply.code(201).send({
+      retryOf: transaction.id,
+      resolution: submittedDecision,
+      onChain: result
+    });
+  });
+
+  app.post("/operator/recovery/tick", {
+    preHandler: requireClobOperatorApiKey
+  }, async (_request, reply) => {
+    if (!operatorRecoveryWorker) {
+      return reply.code(503).send({ error: "Operator transaction recovery worker is not configured" });
+    }
+
+    return reply.code(201).send({ summary: await operatorRecoveryWorker.runOnce() });
+  });
+
+  app.post<{ Params: { provider: string } }>("/sync/:provider/current", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     if (!syncWorker) {
       return reply.code(503).send({ error: "Provider sync worker is not configured" });
     }
@@ -176,7 +300,9 @@ export async function registerRoutes(
     return reply.code(201).send({ summary });
   });
 
-  app.post("/sync/current", async (_request, reply) => {
+  app.post("/sync/current", {
+    preHandler: requireClobOperatorApiKey
+  }, async (_request, reply) => {
     if (!syncWorker) {
       return reply.code(503).send({ error: "Provider sync worker is not configured" });
     }
@@ -185,7 +311,9 @@ export async function registerRoutes(
     return reply.code(201).send({ summary });
   });
 
-  app.post("/settlement/tick", async (request, reply) => {
+  app.post("/settlement/tick", {
+    preHandler: requireClobOperatorApiKey
+  }, async (_request, reply) => {
     if (!settlementWorker) {
       return reply.code(503).send({ error: "Settlement worker is not configured" });
     }
@@ -198,6 +326,11 @@ export async function registerRoutes(
     "/sources/:provider/fixtures",
     async (request, reply) => {
       const query = sourceFixtureQuerySchema.parse(request.query);
+      if (query.persist) {
+        const authReply = await requireClobOperatorApiKey(request, reply);
+        if (authReply) return authReply;
+      }
+
       const sourceQuery: FixtureQuery = {};
       if (query.sport) sourceQuery.sport = query.sport;
       if (query.from) sourceQuery.from = query.from;
@@ -222,6 +355,11 @@ export async function registerRoutes(
     "/sources/:provider/fixtures/current",
     async (request, reply) => {
       const query = currentFixtureQuerySchema.parse(request.query);
+      if (query.persist || query.createMarkets) {
+        const authReply = await requireClobOperatorApiKey(request, reply);
+        if (authReply) return authReply;
+      }
+
       const sport = query.sport ?? (request.params.provider === "api-football" ? "football" : undefined);
       const dates = currentDateWindow(query.days);
       const sourceQueries = rangeCurrentFixtureProvider(request.params.provider)
@@ -250,6 +388,8 @@ export async function registerRoutes(
         ? fixtures.flatMap((fixture) => {
             if (fixture.sport === "football") return createFootballFixtureMarkets(fixture as FootballFixture);
             if (fixture.sport === "basketball") return createBasketballFixtureMarkets(fixture as BasketballFixture);
+            if (fixture.sport === "mma") return createMmaFixtureMarkets(fixture as MmaFixture);
+            if (fixture.sport === "esports") return createEsportsFixtureMarkets(fixture as EsportsFixture);
             return [];
           })
         : [];
@@ -303,7 +443,9 @@ export async function registerRoutes(
     }
   );
 
-  app.post("/fixtures", async (request, reply) => {
+  app.post("/fixtures", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const fixture = fixtureSchema.parse(request.body);
     return reply.code(201).send(store.upsertFixture(fixture));
   });
@@ -345,15 +487,17 @@ export async function registerRoutes(
     return { fixture, insights };
   });
 
-  app.post<{ Params: { id: string } }>("/fixtures/:id/markets", async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/fixtures/:id/markets", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const fixture = store.getFixture(request.params.id);
     if (!fixture) {
       return reply.code(404).send({ error: "Fixture not found" });
     }
 
-    if (fixture.sport !== "football" && fixture.sport !== "basketball") {
+    if (fixture.sport !== "football" && fixture.sport !== "basketball" && fixture.sport !== "mma" && fixture.sport !== "esports") {
       return reply.code(400).send({
-        error: "Generated structured markets are currently only supported for football and basketball fixtures"
+        error: "Generated structured markets are currently only supported for football, basketball, MMA, and esports fixtures"
       });
     }
 
@@ -361,13 +505,19 @@ export async function registerRoutes(
     const markets =
       fixture.sport === "football"
         ? createFootballFixtureMarkets(fixture as FootballFixture, options)
-        : createBasketballFixtureMarkets(fixture as BasketballFixture, options);
+        : fixture.sport === "basketball"
+          ? createBasketballFixtureMarkets(fixture as BasketballFixture, options)
+          : fixture.sport === "mma"
+            ? createMmaFixtureMarkets(fixture as MmaFixture, options)
+            : createEsportsFixtureMarkets(fixture as EsportsFixture, options);
     store.upsertMarkets(markets);
 
     return reply.code(201).send({ markets });
   });
 
-  app.post<{ Params: { id: string } }>("/fixtures/:id/player-markets", async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/fixtures/:id/player-markets", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const fixture = store.getFixture(request.params.id);
     if (!fixture) {
       return reply.code(404).send({ error: "Fixture not found" });
@@ -399,7 +549,9 @@ export async function registerRoutes(
     });
   });
 
-  app.post<{ Params: { id: string } }>("/fixtures/:id/main-card-player-markets", async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/fixtures/:id/main-card-player-markets", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const fixture = store.getFixture(request.params.id);
     if (!fixture) {
       return reply.code(404).send({ error: "Fixture not found" });
@@ -449,14 +601,17 @@ export async function registerRoutes(
 
       const candidates = await source.listPlayerCandidates({
         externalFixtureId: fixture.source.externalFixtureId,
-        limitPerTeam: input.limitPerTeam
+        limitPerTeam: input.limitPerTeam,
+        cache: store
       });
 
       return { fixture, candidates };
     }
   );
 
-  app.post<{ Params: { id: string } }>("/fixtures/:id/auto-main-card-player-markets", async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/fixtures/:id/auto-main-card-player-markets", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const fixture = store.getFixture(request.params.id);
     if (!fixture) {
       return reply.code(404).send({ error: "Fixture not found" });
@@ -478,7 +633,8 @@ export async function registerRoutes(
 
     const candidates = await source.listPlayerCandidates({
       externalFixtureId: fixture.source.externalFixtureId,
-      limitPerTeam: input.limitPerTeam
+      limitPerTeam: input.limitPerTeam,
+      cache: store
     });
     const markets = candidates.map((candidate) =>
       createMainCardPlayerMarket({
@@ -500,7 +656,34 @@ export async function registerRoutes(
     });
   });
 
-  app.post("/markets/yes-no", async (request, reply) => {
+  app.post("/markets/player-futures", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
+    const input = createPlayerTournamentFuturesSchema.parse(request.body ?? {});
+    const markets = input.markets.map((market) =>
+      createPlayerTournamentFutureMarket({
+        provider: input.provider,
+        competition: input.competition,
+        playerId: market.playerId,
+        playerName: market.playerName,
+        teamName: market.teamName,
+        imageUrl: market.imageUrl,
+        template: market.template,
+        line: market.line,
+        status: input.status
+      })
+    );
+    store.upsertMarkets(markets);
+
+    return reply.code(201).send({
+      markets,
+      cards: buildMarketSummaryCards(store, markets)
+    });
+  });
+
+  app.post("/markets/yes-no", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const input = createYesNoMarketSchema.parse(request.body);
     const market = createYesNoMarket(input);
     store.upsertMarket(market);
@@ -576,18 +759,26 @@ export async function registerRoutes(
     return market;
   });
 
-  app.post<{ Params: { id: string } }>("/markets/:id/create-on-chain", async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/markets/:id/create-on-chain", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const market = store.getMarket(request.params.id);
     if (!market) {
       return reply.code(404).send({ error: "Market not found" });
     }
 
     const input = createMarketOnChainSchema.parse(request.body ?? {});
-    const result = await createMarketOnChain({
-      marketId: market.id,
-      questionId: input.questionId as Hex | undefined,
-      marketType: market.type,
-      metadataURI: input.metadataURI ?? `market:${market.id}`
+    const result = await runTrackedOperatorTransaction(store, {
+      action: "CREATE_MARKET",
+      entityId: market.id,
+      metadata: { marketId: market.id, marketType: market.type, source: "api" },
+      execute: (onSubmitted) => createMarketOnChain({
+        marketId: market.id,
+        questionId: input.questionId as Hex | undefined,
+        marketType: market.type,
+        metadataURI: input.metadataURI ?? `market:${market.id}`,
+        onSubmitted
+      })
     });
 
     const updatedMarket: MarketDefinition = {
@@ -602,7 +793,9 @@ export async function registerRoutes(
     });
   });
 
-  app.post<{ Params: { id: string } }>("/markets/:id/resolve", async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/markets/:id/resolve", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const market = store.getMarket(request.params.id);
     if (!market) {
       return reply.code(404).send({ error: "Market not found" });
@@ -622,7 +815,30 @@ export async function registerRoutes(
     return reply.code(201).send(decision);
   });
 
-  app.post<{ Params: { id: string } }>("/markets/:id/submit-resolution", async (request, reply) => {
+  app.post<{ Params: { id: string } }>("/markets/:id/review-resolution", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
+    const market = store.getMarket(request.params.id);
+    if (!market) {
+      return reply.code(404).send({ error: "Market not found" });
+    }
+
+    const decision = store.getResolution(market.id);
+    if (!decision) {
+      return reply.code(400).send({ error: "Compute the market resolution before reviewing it" });
+    }
+    if (decision.status !== "computed") {
+      return reply.code(409).send({ error: "Only computed resolutions can be reviewed" });
+    }
+
+    const reviewedDecision = markResolutionReviewed(decision);
+    store.upsertResolution(reviewedDecision);
+    return reply.code(201).send(reviewedDecision);
+  });
+
+  app.post<{ Params: { id: string } }>("/markets/:id/submit-resolution", {
+    preHandler: requireClobOperatorApiKey
+  }, async (request, reply) => {
     const market = store.getMarket(request.params.id);
     if (!market) {
       return reply.code(404).send({ error: "Market not found" });
@@ -641,9 +857,17 @@ export async function registerRoutes(
         error: "VOID resolutions require the void/refund resolver path before they can be submitted on-chain"
       });
     }
+    if (decision.status !== "reviewed") {
+      return reply.code(409).send({ error: "Resolution must be reviewed before submission" });
+    }
 
     const questionId = (input.questionId ?? hashIdentifier(market.id)) as Hex;
-    const result = await resolveMarketOnChain(questionId, outcomeSideToResolverOutcome(decision.outcome));
+    const result = await submitResolutionOperatorTransaction(store, {
+      marketId: market.id,
+      outcome: decision.outcome,
+      questionId,
+      metadata: { marketId: market.id, outcome: decision.outcome, questionId, source: "api" }
+    });
     const submittedDecision: ResolutionDecision = {
       ...decision,
       status: "submitted"
@@ -798,6 +1022,10 @@ export async function registerRoutes(
     let autoMatch;
     try {
       autoMatch = await autoMatchOrder(store, stored);
+      if (!autoMatch.matched) {
+        const houseMatch = await fillWithHouseLiquidity(store, store.getClobOrder(stored.id) ?? stored);
+        if (houseMatch.attempted) autoMatch = houseMatch;
+      }
       if (autoMatch.matched) {
         request.log.info({
           marketId: market.id,
@@ -805,6 +1033,12 @@ export async function registerRoutes(
           tradeId: autoMatch.result?.trade.id,
           transactionHash: autoMatch.result?.trade.transactionHash
         }, "Automatically matched CLOB order");
+      } else if (autoMatch.attempted) {
+        request.log.info({
+          marketId: market.id,
+          orderId: stored.id,
+          reason: autoMatch.reason
+        }, "CLOB order left open after matching attempts");
       }
     } catch (error) {
       request.log.warn({
@@ -906,6 +1140,10 @@ export async function registerRoutes(
   }, async (request, reply) => {
     const input = tickClobMatcherSchema.parse(request.body ?? {});
     const summaries = await tickAutoMatcher(store, input);
+    const remaining = input.limit - summaries.length;
+    if (remaining > 0) {
+      summaries.push(...await tickHouseLiquidity(store, { ...input, limit: remaining }));
+    }
     const matched = summaries.filter((summary) => summary.matched).length;
 
     request.log.info({
@@ -1050,6 +1288,92 @@ function writeMarketEvent(
   stream.write(`id: ${event.id}\n`);
   stream.write(`event: ${event.type}\n`);
   stream.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
+function operatorTransactionStatus(status: string | undefined) {
+  if (status === "attempted" || status === "pending" || status === "confirmed" || status === "failed") {
+    return status;
+  }
+  return undefined;
+}
+
+function operatorTransactionAction(action: string | undefined) {
+  if (action === "CREATE_MARKET" || action === "MATCH_ORDERS" || action === "SUBMIT_RESOLUTION") {
+    return action;
+  }
+  return undefined;
+}
+
+function walletConnectionConfig() {
+  const chain = xLayerChain();
+  return {
+    chain: {
+      id: chain.id,
+      hexId: hexChainId(chain.id),
+      name: chain.name,
+      nativeCurrency: chain.nativeCurrency,
+      rpcUrls: chain.rpcUrls.default.http
+    },
+    walletAddEthereumChain: {
+      chainId: hexChainId(chain.id),
+      chainName: chain.name,
+      nativeCurrency: chain.nativeCurrency,
+      rpcUrls: chain.rpcUrls.default.http
+    },
+    contracts: {
+      collateralToken: env.COLLATERAL_TOKEN_ADDRESS || undefined,
+      conditionalTokens: env.CONDITIONAL_TOKENS_ADDRESS || undefined,
+      ctfExchange: env.CTF_EXCHANGE_ADDRESS || undefined,
+      marketFactory: env.MARKET_FACTORY_ADDRESS || undefined,
+      binaryMarketResolver: env.BINARY_MARKET_RESOLVER_ADDRESS || undefined
+    },
+    clobOrderSigning: {
+      domain: {
+        ...exchangeDomain,
+        chainId: chain.id,
+        verifyingContract: env.CTF_EXCHANGE_ADDRESS || undefined
+      },
+      primaryType: "Order"
+    },
+    capabilities: {
+      signClobOrders: Boolean(env.CTF_EXCHANGE_ADDRESS),
+      buyApprovalTransactions: Boolean(env.COLLATERAL_TOKEN_ADDRESS && env.CTF_EXCHANGE_ADDRESS),
+      sellApprovalTransactions: Boolean(env.CONDITIONAL_TOKENS_ADDRESS && env.CTF_EXCHANGE_ADDRESS),
+      redemptionTransactions: Boolean(env.COLLATERAL_TOKEN_ADDRESS && env.CONDITIONAL_TOKENS_ADDRESS)
+    }
+  };
+}
+
+function hexChainId(chainId: number): Hex {
+  return `0x${chainId.toString(16)}` as Hex;
+}
+
+async function submitResolutionOperatorTransaction(
+  store: InMemoryStore,
+  input: {
+    marketId: string;
+    outcome: string;
+    questionId: Hex;
+    metadata: Record<string, unknown>;
+  }
+) {
+  return runTrackedOperatorTransaction(store, {
+    action: "SUBMIT_RESOLUTION",
+    entityId: input.marketId,
+    metadata: input.metadata,
+    execute: (onSubmitted) => resolveMarketOnChain(
+      input.questionId,
+      outcomeSideToResolverOutcome(input.outcome),
+      { onSubmitted }
+    )
+  });
+}
+
+function resolutionQuestionId(metadata: unknown): Hex | undefined {
+  if (!metadata || typeof metadata !== "object") return undefined;
+  const questionId = (metadata as { questionId?: unknown }).questionId;
+  if (typeof questionId !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(questionId)) return undefined;
+  return questionId as Hex;
 }
 
 function hasFixtureMismatch(market: MarketDefinition, resultFixtureId: string): boolean {
@@ -1207,14 +1531,29 @@ function buildMarketSummaryCards(store: InMemoryStore, markets: MarketDefinition
     ];
   });
   const fixtureCardIds = new Set(fixtureMarkets.map((market) => market.id));
+  const playerFutureCards = markets
+    .filter((market) => market.template?.category === "PLAYER_FUTURE")
+    .map((market) => ({
+      type: "PLAYER_FUTURE",
+      playerName: market.template?.category === "PLAYER_FUTURE"
+        ? market.template.player.playerName
+        : undefined,
+      player: market.template?.category === "PLAYER_FUTURE"
+        ? market.template.player
+        : undefined,
+      competition: market.template?.category === "PLAYER_FUTURE"
+        ? market.template.competition
+        : undefined,
+      summaries: [buildMarketSummary(store, market)]
+    }));
   const standaloneCards = markets
-    .filter((market) => !fixtureCardIds.has(market.id))
+    .filter((market) => !fixtureCardIds.has(market.id) && market.template?.category !== "PLAYER_FUTURE")
     .map((market) => ({
       type: "MARKET",
       summaries: [buildMarketSummary(store, market)]
     }));
 
-  return [...fixtureCards, ...standaloneCards];
+  return [...fixtureCards, ...playerFutureCards, ...standaloneCards];
 }
 
 function refreshStoredOrderStatus(
@@ -1264,6 +1603,8 @@ async function loadPortfolioPositions(
 
     return [
       enrichPortfolioPosition({
+        store,
+        account,
         market,
         token0: balance.token0,
         token1: balance.token1,
@@ -1301,7 +1642,7 @@ function filteredMarkets(
     provider?: string | undefined;
     fixtureStatus?: FixtureStatus | undefined;
     marketType?: MarketDefinition["type"] | undefined;
-    category?: "match" | "player" | "main_player" | "standalone" | undefined;
+    category?: "match" | "player" | "main_player" | "player_future" | "standalone" | undefined;
     competitionId?: string | undefined;
     competitionName?: string | undefined;
   }
@@ -1318,6 +1659,7 @@ function filteredMarkets(
     })
     .filter((market) => {
       if (!query.sport) return true;
+      if (market.template?.category === "PLAYER_FUTURE") return query.sport === "football";
       if (!market.fixtureId) return false;
       return store.getFixture(market.fixtureId)?.sport === query.sport;
     })
@@ -1328,11 +1670,17 @@ function filteredMarkets(
     })
     .filter((market) => {
       if (!query.competitionId) return true;
+      if (market.template?.category === "PLAYER_FUTURE") {
+        return market.template.competition.id?.toLowerCase() === query.competitionId.toLowerCase();
+      }
       if (!market.fixtureId) return false;
       return store.getFixture(market.fixtureId)?.competition?.id?.toLowerCase() === query.competitionId.toLowerCase();
     })
     .filter((market) => {
       if (!query.competitionName) return true;
+      if (market.template?.category === "PLAYER_FUTURE") {
+        return market.template.competition.name.toLowerCase().includes(query.competitionName.toLowerCase());
+      }
       if (!market.fixtureId) return false;
       return store.getFixture(market.fixtureId)?.competition?.name.toLowerCase()
         .includes(query.competitionName.toLowerCase()) ?? false;
@@ -1508,16 +1856,20 @@ function discoveryProvider(store: InMemoryStore, market: MarketDefinition): stri
 }
 
 function discoveryCategory(market: MarketDefinition) {
-  if (!market.fixtureId) return "standalone";
   if (market.template?.category === "PLAYER") return "player";
   if (market.template?.category === "MAIN_PLAYER") return "main_player";
+  if (market.template?.category === "PLAYER_FUTURE") return "player_future";
+  if (!market.fixtureId) return "standalone";
   return "match";
 }
 
 function matchesDiscoverySearch(store: InMemoryStore, market: MarketDefinition, query: string): boolean {
   const fixture = market.fixtureId ? store.getFixture(market.fixtureId) : undefined;
-  const player = market.template?.category === "PLAYER" || market.template?.category === "MAIN_PLAYER"
+  const player = market.template?.category === "PLAYER" || market.template?.category === "MAIN_PLAYER" || market.template?.category === "PLAYER_FUTURE"
     ? market.template.player
+    : undefined;
+  const futureCompetition = market.template?.category === "PLAYER_FUTURE"
+    ? market.template.competition
     : undefined;
   const terms = [
     market.id,
@@ -1538,10 +1890,15 @@ function matchesDiscoverySearch(store: InMemoryStore, market: MarketDefinition, 
     fixture?.competition?.name,
     fixture?.competition?.season,
     fixture?.competition?.kind,
+    futureCompetition?.id,
+    futureCompetition?.name,
+    futureCompetition?.season,
+    futureCompetition?.kind,
     fixture && "gameTitle" in fixture ? fixture.gameTitle : undefined,
     fixture && "tournamentName" in fixture ? fixture.tournamentName : undefined,
     player?.playerId,
-    player?.playerName
+    player?.playerName,
+    player?.teamName
   ];
   const needle = query.toLowerCase();
 

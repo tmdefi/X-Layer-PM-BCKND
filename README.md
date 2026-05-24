@@ -14,6 +14,7 @@ Supported fixture sports:
 - `basketball`
 - `american_football`
 - `esports`
+- `mma`
 
 All current market types map to two Conditional Tokens outcome slots:
 
@@ -36,7 +37,17 @@ Use `createFootballFixtureMarkets` for these generated football markets.
 
 ## Other Sports Markets
 
-Basketball, American football, and esports fixtures are supported at the fixture/model layer. For now, these sports should use generic `YES_NO` markets until sport-specific market types are added.
+Basketball and MMA currently use binary fighter/team winner `YES_NO` markets. American football and esports fixtures are supported at the fixture/model layer and should use generic `YES_NO` markets until sport-specific market types are added.
+
+UFC fights come from API-Sports API-MMA through provider `api-mma`. The backend generates one fighter-win market for each side of a UFC fight and resolves draw/no-contest style finished results as `VOID` until a single winner is present.
+
+```env
+API_MMA_KEY=
+API_MMA_BASE_URL=https://v1.mma.api-sports.io
+API_MMA_PROMOTION_FILTER=UFC
+```
+
+`API_MMA_KEY` falls back to `API_FOOTBALL_KEY` because both providers use API-Sports authentication. Set `API_MMA_PROMOTION_FILTER` to the promotion label present in API-MMA fight competition data; the default keeps the source focused on UFC fights.
 
 Examples:
 
@@ -82,7 +93,7 @@ Resolution flow:
 1. Fetch the final result from the configured source.
 2. Confirm the provider result belongs to the market fixture.
 3. Compute a `ResolutionDecision`.
-4. Mark it `reviewed`.
+4. Mark it `reviewed` with `POST /markets/:id/review-resolution`.
 5. Submit the decision on-chain from the oracle wallet.
 6. Mark it `submitted` after the transaction is accepted/indexed.
 
@@ -112,6 +123,23 @@ npm run prisma:generate
 npm run prisma:deploy
 npm test
 ```
+
+## Wallet Connection
+
+The frontend can bootstrap wallet connection from the public backend config route:
+
+```text
+GET /wallet/config
+```
+
+It returns the X Layer chain id in decimal and wallet hex form, public RPC data, the `wallet_addEthereumChain` payload, configured market contract addresses, the CLOB order-signing domain, and capability flags for approvals and redemption payloads. Backend keys and operator API credentials are never returned.
+
+Frontend flow:
+
+1. Request wallet accounts from the injected wallet or chosen wallet connector.
+2. Fetch `/wallet/config`.
+3. Switch to `walletAddEthereumChain.chainId`; if the wallet does not know the chain, add it with `walletAddEthereumChain`.
+4. Use the connected account for order readiness, order preparation, typed-data signing, approval payloads, cancellations, and redemption payloads.
 
 ## Automated Sync
 
@@ -164,6 +192,31 @@ The settlement worker applies a two-observation early-resolution policy before i
 
 The first observation stores an early resolution candidate and closes trading for that market. A matching later observation confirms the candidate and submits the resolver transaction when `SETTLEMENT_SUBMIT_ON_CHAIN=true`. Markets that can still reverse, such as match winner, draw, first-half winner before half-time, total-goals `UNDER`, BTTS `NO`, and player-to-score `NO`, wait for their normal settlement point.
 
+Settlement API polling is live-first to protect provider quota:
+
+- featured live fixtures are checked on the settlement worker interval
+- fixtures tracked as live and then missing from the live feed get an immediate result check
+- stored finished, cancelled, abandoned, or postponed fixtures get a result check and then settle once
+- scheduled fixtures far from kickoff do not get per-minute result checks
+- scheduled fixtures near kickoff use the slower fallback window below
+
+```env
+SETTLEMENT_NEAR_KICKOFF_WINDOW_MINUTES=180
+SETTLEMENT_NEAR_KICKOFF_FALLBACK_INTERVAL_SECONDS=300
+```
+
+Set `SETTLEMENT_NEAR_KICKOFF_FALLBACK_INTERVAL_SECONDS=0` to rely only on live feed and terminal fixture status for scheduled fixtures.
+
+API-Football main-card player candidate ranking caches team stats by provider league, player-stat season, and team. That keeps repeated fixtures for the same World Cup team from rerunning the `/players` fan-out every time player scorer markets are prepared:
+
+```env
+PLAYER_CANDIDATE_CACHE_SCHEDULED_SECONDS=21600
+PLAYER_CANDIDATE_CACHE_NEAR_KICKOFF_SECONDS=3600
+PLAYER_CANDIDATE_CACHE_NEAR_KICKOFF_WINDOW_MINUTES=1440
+```
+
+The fixture lookup still happens when candidates are requested, but the expensive per-team player-stat ranking work reuses the persisted cache. Live trading and settlement do not refresh player candidate rankings.
+
 1. `POST /clob/orders/readiness` checks the maker balance and exchange approval for the planned BUY or SELL order.
 2. `POST /clob/orders/prepare` resolves `marketId + outcomeSide` to the on-chain token id and returns an unsigned order, typed data for the maker wallet, and the same readiness data.
 3. The wallet signs the typed data and the client submits the signed order to `POST /clob/orders`.
@@ -200,6 +253,8 @@ The first matcher pass covers complementary `BUY` vs `SELL` orders for the same 
 
 `POST /clob/matches` and `POST /clob/matcher/tick` are operator routes because they submit transactions through the backend operator wallet. Set a long random `CLOB_OPERATOR_API_KEY` and send it in the `x-operator-api-key` header for those routes.
 
+The same operator header protects backend-owned mutation routes for provider sync, settlement ticks, fixture and market creation, on-chain market creation, resolution computation, review, and submission. Source fixture reads also require it when `persist=true` or `createMarkets=true` asks the backend to write fetched data.
+
 Order entry is rate-limited per client IP on both `POST /clob/orders/prepare` and `POST /clob/orders`:
 
 ```env
@@ -209,6 +264,67 @@ CLOB_ORDER_RATE_LIMIT_WINDOW=1 minute
 ```
 
 Accepted order preparation and signed order submission events are written to Fastify logs with market, order, side, maker, and client IP fields. Signatures and API keys are not logged.
+
+### Operator Transactions
+
+Backend-submitted chain actions are recorded in the database before they are sent and updated as the operator wallet broadcasts or confirms them:
+
+- market creation records `CREATE_MARKET`
+- CLOB matching records `MATCH_ORDERS`
+- resolver submission records `SUBMIT_RESOLUTION`
+
+Statuses are `attempted`, `pending`, `confirmed`, and `failed`. `pending` rows include the broadcast transaction hash when the chain wrapper receives it, and a still-active transaction for the same action/entity blocks a duplicate submit path.
+
+The protected operator endpoint exposes recent records:
+
+```text
+GET /operator/transactions?status=pending&action=SUBMIT_RESOLUTION
+```
+
+Send the same `x-operator-api-key` header used for matcher operator routes. The next reliability step after this ledger is receipt polling and retry/recovery for records that remain pending or failed after RPC disruption or backend restart.
+
+A partial recovery loop is enabled by default:
+
+```env
+OPERATOR_TX_RECOVERY_WORKER_ENABLED=true
+OPERATOR_TX_RECOVERY_POLL_INTERVAL_SECONDS=60
+OPERATOR_TX_RECOVERY_LIMIT=100
+```
+
+It checks saved `pending` operator transaction receipts, marks successful receipts `confirmed`, marks reverted receipts `failed`, restores submitted resolution state, and recovers a created market `conditionId` from on-chain state when needed.
+
+Confirmed `MATCH_ORDERS` rows also recover CLOB bookkeeping from the saved match metadata when a crash happens after the exchange transaction but before local trade persistence:
+
+- reconstruct the taker/maker match plan
+- record the missing trade and fills
+- update remaining maker sizes and order statuses
+- store the recovered trade id, tx hash, and order statuses in the operator transaction result
+
+CLOB recovery is idempotent by transaction hash: a trade already recorded for that exchange tx is not replayed, and the database enforces one stored trade per match tx hash.
+
+Operator retries are deliberately narrow:
+
+- an action with a broadcast tx hash remains `pending` if receipt waiting fails, so recovery checks the saved hash before any new submit
+- a reverted broadcast tx becomes terminal `failed` after recovery sees the receipt and is not blindly resubmitted
+- a no-hash failed market creation or match may use its normal fresh submit path again
+- a no-hash failed resolution requires the protected operator retry route
+
+Transaction listing includes a `retryPolicy` payload explaining the disposition. Manual resolution retry:
+
+```text
+POST /operator/transactions/:id/retry-resolution
+```
+
+Send `x-operator-api-key`. The route only accepts failed `SUBMIT_RESOLUTION` rows with no recorded tx hash and creates a new tracked submit attempt from the saved resolution.
+
+Operator recovery visibility and manual ticking:
+
+```text
+GET /operator/recovery/status
+POST /operator/recovery/tick
+```
+
+The manual tick route is protected with `x-operator-api-key`.
 
 Frontend market data:
 

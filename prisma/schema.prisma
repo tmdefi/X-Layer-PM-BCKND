@@ -108,7 +108,7 @@ model ClobTrade {
   id                String   @id
   marketId          String
   takerOrderId      String
-  transactionHash   String
+  transactionHash   String   @unique
   takerFillAmount   String
   makerFillAmounts  Json
   createdAt         DateTime @default(now())
@@ -119,7 +119,6 @@ model ClobTrade {
   fills       ClobFill[]
 
   @@index([marketId, createdAt])
-  @@index([transactionHash])
 }
 
 model ClobTradeMaker {
@@ -165,6 +164,17 @@ model FixtureInsightsCache {
   @@index([expiresAt])
 }
 
+model PlayerCandidateCache {
+  cacheKey   String   @id
+  candidates Json
+  cachedAt   DateTime
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
 model ProviderSyncLog {
   id         String   @id @default(cuid())
   provider   String
@@ -176,4 +186,24 @@ model ProviderSyncLog {
 
   @@index([provider, jobType, startedAt])
   @@index([status, startedAt])
+}
+
+model OperatorTransaction {
+  id          String   @id
+  action      String
+  entityId    String
+  status      String
+  txHash      String?
+  metadata    Json?
+  result      Json?
+  error       String?
+  submittedAt DateTime?
+  confirmedAt DateTime?
+  failedAt    DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([action, entityId, status])
+  @@index([status, updatedAt])
+  @@index([txHash])
 }
