@@ -47,7 +47,7 @@ export async function createMarketOnChain(
   const marketId = hashIdentifier(input.marketId);
   const questionId = input.questionId ?? hashIdentifier(input.marketId);
 
-  const hash = await clients.walletClient.writeContract({
+  const hash = await writeContractWithNonceRetry(clients, {
     address: marketFactory,
     abi: marketFactoryAbi,
     functionName: "createBinaryMarket",
@@ -148,6 +148,39 @@ export function hashIdentifier(value: string): Hex {
 
 export async function getOperatorTransactionReceipt(hash: Hex) {
   return createPublicChainClient().getTransactionReceipt({ hash });
+}
+
+async function writeContractWithNonceRetry(
+  clients: ReturnType<typeof createChainClients>,
+  request: Parameters<typeof clients.walletClient.writeContract>[0]
+): Promise<Hex> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const nonce = attempt === 0
+        ? undefined
+        : await clients.publicClient.getTransactionCount({
+          address: clients.account.address,
+          blockTag: "pending"
+        });
+      return await clients.walletClient.writeContract({
+        ...request,
+        ...(nonce === undefined ? {} : { nonce })
+      });
+    } catch (error) {
+      lastError = error;
+      if (!isNonceTooLowError(error) || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+
+  throw lastError;
+}
+
+function isNonceTooLowError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /nonce (provided .* lower|too low|has already been used)|nonce provided .* lower/i.test(message);
 }
 
 function findMarketCreatedEvent(receipt: TransactionReceipt, marketFactory: Address) {

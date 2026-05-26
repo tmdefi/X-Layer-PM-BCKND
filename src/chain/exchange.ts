@@ -52,9 +52,15 @@ export async function prepareExchangeOrder(input: {
 }) {
   const exchange = exchangeAddress();
   const market = await getMarketOnChain(input.marketId);
-  if (!market) throw new Error(`Market ${input.marketId} has not been created on-chain`);
+  if (!market) {
+    throw Object.assign(
+      new Error(`Market ${input.marketId} has not been recreated under the current USDC market factory`),
+      { statusCode: 409 }
+    );
+  }
 
   const publicClient = createPublicChainClient();
+  await assertMarketUsesCurrentCollateral(publicClient, market);
   const nonce = await publicClient.readContract({
     address: exchange,
     abi: ctfExchangeAbi,
@@ -146,12 +152,18 @@ export type ExchangeOrderReadiness = {
 
 export async function getExchangeOrderReadiness(input: ExchangeOrderReadinessInput): Promise<ExchangeOrderReadiness> {
   const market = await getMarketOnChain(input.marketId);
-  if (!market) throw new Error(`Market ${input.marketId} has not been created on-chain`);
+  if (!market) {
+    throw Object.assign(
+      new Error(`Market ${input.marketId} has not been recreated under the current USDC market factory`),
+      { statusCode: 409 }
+    );
+  }
 
   const publicClient = createPublicChainClient();
   const exchange = exchangeAddress();
   const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
   const conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
+  await assertMarketUsesCurrentCollateral(publicClient, market, collateral, conditionalTokens);
   const tokenId = input.outcomeSide === "NO" || input.outcomeSide === "UNDER" ? market.token0 : market.token1;
   const requiredAmount = BigInt(input.makerAmount);
 
@@ -232,6 +244,13 @@ export async function getAccountPortfolioBalances(
     markets.map(async (market) => {
       const stored = await getMarketOnChain(market.id);
       if (!stored) return undefined;
+      const usesCurrentCollateral = await marketUsesCurrentCollateral(
+        publicClient,
+        conditionalTokens,
+        collateral,
+        stored
+      );
+      if (!usesCurrentCollateral) return undefined;
 
       const [balance0, balance1] = await Promise.all([
         publicClient.readContract({
@@ -275,6 +294,19 @@ export async function redemptionTransaction(marketId: string) {
 
   const conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
   const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+  const publicClient = createPublicChainClient();
+  const usesCurrentCollateral = await marketUsesCurrentCollateral(
+    publicClient,
+    conditionalTokens,
+    collateral,
+    stored
+  );
+  if (!usesCurrentCollateral) {
+    throw Object.assign(
+      new Error("Market positions were not created with the configured USDC collateral token"),
+      { statusCode: 409 }
+    );
+  }
 
   return {
     to: conditionalTokens,
@@ -284,6 +316,72 @@ export async function redemptionTransaction(marketId: string) {
       args: [collateral, zeroHash, stored.conditionId, [1n, 2n]]
     })
   };
+}
+
+async function marketUsesCurrentCollateral(
+  publicClient: ReturnType<typeof createPublicChainClient>,
+  conditionalTokens: Address,
+  collateral: Address,
+  stored: {
+    conditionId: Hex;
+    token0: string;
+    token1: string;
+  }
+) {
+  const [collection0, collection1] = await Promise.all([
+    publicClient.readContract({
+      address: conditionalTokens,
+      abi: erc1155ConditionalTokensAbi,
+      functionName: "getCollectionId",
+      args: [zeroHash, stored.conditionId, 1n]
+    }),
+    publicClient.readContract({
+      address: conditionalTokens,
+      abi: erc1155ConditionalTokensAbi,
+      functionName: "getCollectionId",
+      args: [zeroHash, stored.conditionId, 2n]
+    })
+  ]);
+  const [position0, position1] = await Promise.all([
+    publicClient.readContract({
+      address: conditionalTokens,
+      abi: erc1155ConditionalTokensAbi,
+      functionName: "getPositionId",
+      args: [collateral, collection0]
+    }),
+    publicClient.readContract({
+      address: conditionalTokens,
+      abi: erc1155ConditionalTokensAbi,
+      functionName: "getPositionId",
+      args: [collateral, collection1]
+    })
+  ]);
+
+  return position0.toString() === stored.token0 && position1.toString() === stored.token1;
+}
+
+async function assertMarketUsesCurrentCollateral(
+  publicClient: ReturnType<typeof createPublicChainClient>,
+  stored: {
+    conditionId: Hex;
+    token0: string;
+    token1: string;
+  },
+  collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS"),
+  conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS")
+) {
+  const usesCurrentCollateral = await marketUsesCurrentCollateral(
+    publicClient,
+    conditionalTokens,
+    collateral,
+    stored
+  );
+  if (!usesCurrentCollateral) {
+    throw Object.assign(
+      new Error("Market was created with a different USDC collateral token and must be recreated"),
+      { statusCode: 409 }
+    );
+  }
 }
 
 export function buildBuyOrderReadiness(input: {
@@ -464,22 +562,61 @@ export async function matchExchangeOrders(input: {
 }): Promise<Hex> {
   const clients = createChainClients();
   const exchange = exchangeAddress();
-  const hash = await clients.walletClient.writeContract({
-    address: exchange,
-    abi: ctfExchangeAbi,
-    functionName: "matchOrders",
-    args: [
-      toContractOrder(input.takerOrder.order),
-      input.makerOrders.map((order) => toContractOrder(order.order)),
-      BigInt(input.takerFillAmount),
-      input.makerFillAmounts.map(BigInt)
-    ],
-    account: clients.account
-  });
+  const args = [
+    toContractOrder(input.takerOrder.order),
+    input.makerOrders.map((order) => toContractOrder(order.order)),
+    BigInt(input.takerFillAmount),
+    input.makerFillAmounts.map(BigInt)
+  ] as const;
+
+  const hash = await writeMatchOrdersWithNonceRetry(clients, exchange, args);
   input.onSubmitted?.(hash);
   const receipt = await clients.publicClient.waitForTransactionReceipt({ hash });
   if (receipt.status !== "success") throw new Error(`Order match transaction failed: ${hash}`);
   return hash;
+}
+
+async function writeMatchOrdersWithNonceRetry(
+  clients: ReturnType<typeof createChainClients>,
+  exchange: Address,
+  args: readonly [
+    ReturnType<typeof toContractOrder>,
+    ReturnType<typeof toContractOrder>[],
+    bigint,
+    bigint[]
+  ]
+): Promise<Hex> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const nonce = attempt === 0
+        ? undefined
+        : await clients.publicClient.getTransactionCount({
+          address: clients.account.address,
+          blockTag: "pending"
+        });
+      return await clients.walletClient.writeContract({
+        address: exchange,
+        abi: ctfExchangeAbi,
+        functionName: "matchOrders",
+        args,
+        account: clients.account,
+        ...(nonce === undefined ? {} : { nonce })
+      });
+    } catch (error) {
+      lastError = error;
+      if (!isNonceTooLowError(error) || attempt === 2) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    }
+  }
+
+  throw lastError;
+}
+
+function isNonceTooLowError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /nonce (provided .* lower|too low|has already been used)/i.test(message);
 }
 
 export function exchangeAddress(): Address {

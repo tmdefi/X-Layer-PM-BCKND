@@ -56,7 +56,7 @@ export async function buildApp() {
 
     app.log.error(error);
     return reply.code(500).send({
-      error: "Internal server error"
+      error: error instanceof Error ? error.message : "Internal server error"
     });
   });
 

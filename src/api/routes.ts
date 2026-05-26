@@ -744,7 +744,7 @@ export async function registerRoutes(
     const cards = sortedMarketSummaryCards(buildMarketSummaryCards(store, markets), query);
     const page = pageItems(cards, query);
     return {
-      cards: page.items,
+      cards: await markCardsMissingCurrentFactoryMarkets(page.items),
       pagination: page.pagination,
       sort: discoverySort(query)
     };
@@ -1479,7 +1479,9 @@ function buildMarketCards(
 ) {
   return fixtures.flatMap((fixture) => {
     const fixtureMarkets = markets.filter((market) => market.fixtureId === fixture.id);
-    const mainMarkets = fixtureMarkets.filter((market) => market.template?.category !== "PLAYER");
+    const mainMarkets = fixtureMarkets
+      .filter((market) => market.template?.category !== "PLAYER")
+      .filter((market) => isSupportedFixtureCardMarket(fixture, market));
     const playerMarkets = fixtureMarkets.filter((market) => market.template?.category === "PLAYER");
 
     return [
@@ -1507,6 +1509,7 @@ function buildMarketSummaryCards(store: InMemoryStore, markets: MarketDefinition
   const fixtureCards = fixtures.flatMap((fixture) => {
     const summaries = fixtureMarkets
       .filter((market) => market.fixtureId === fixture.id)
+      .filter((market) => isSupportedFixtureCardMarket(fixture, market))
       .map((market) => buildMarketSummary(store, market));
     const mainMarkets = summaries.filter((summary) => summary.market.template?.category !== "PLAYER");
     const playerMarkets = summaries.filter((summary) => summary.market.template?.category === "PLAYER");
@@ -1554,6 +1557,111 @@ function buildMarketSummaryCards(store: InMemoryStore, markets: MarketDefinition
     }));
 
   return [...fixtureCards, ...playerFutureCards, ...standaloneCards];
+}
+
+const currentFactoryMarketCache = new Map<string, { checkedAt: number; conditionId?: string | undefined }>();
+const CURRENT_FACTORY_MARKET_CACHE_MS = 5 * 60_000;
+const MARKET_SYNCING_REASON = "Market syncing on-chain";
+
+async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<string, unknown>>>(cards: T): Promise<T> {
+  const markets = cards.flatMap((card) =>
+    Array.isArray(card.summaries)
+      ? card.summaries
+        .map((summary) => summary && typeof summary === "object" && "market" in summary
+          ? (summary as { market?: MarketDefinition }).market
+          : undefined)
+        .filter((market): market is MarketDefinition => Boolean(market))
+      : []
+  );
+  const uniqueOpenMarkets = [...new Map(
+    markets
+      .filter((market) => market.status === "open")
+      .map((market) => [market.id, market])
+  ).values()];
+
+  const conditionIds = new Map<string, string | undefined>();
+  await mapWithConcurrency(uniqueOpenMarkets, 12, async (market) => {
+    conditionIds.set(market.id, await currentFactoryConditionId(market.id));
+  });
+
+  return cards.map((card) => {
+    if (!Array.isArray(card.summaries)) return card;
+    const summaries = card.summaries.map((summary) => {
+      if (!summary || typeof summary !== "object" || !("market" in summary)) return summary;
+      const market = (summary as { market?: MarketDefinition }).market;
+      if (!market || market.status !== "open") return summary;
+      const currentConditionId = conditionIds.get(market.id);
+      if (currentConditionId) {
+        return {
+          ...summary,
+          market: {
+            ...market,
+            conditionId: currentConditionId,
+            ...(market.tradingStatusReason === MARKET_SYNCING_REASON ? { tradingStatusReason: undefined } : {})
+          }
+        };
+      }
+      return {
+        ...summary,
+        market: {
+          ...market,
+          conditionId: undefined,
+          tradingStatus: "suspended",
+          tradingStatusReason: MARKET_SYNCING_REASON,
+          tradingStatusUpdatedAt: new Date().toISOString()
+        }
+      };
+    });
+    return { ...card, summaries };
+  }) as T;
+}
+
+async function currentFactoryConditionId(marketId: string): Promise<string | undefined> {
+  const cached = currentFactoryMarketCache.get(marketId);
+  if (cached && Date.now() - cached.checkedAt < CURRENT_FACTORY_MARKET_CACHE_MS) {
+    return cached.conditionId;
+  }
+
+  try {
+    const stored = await getMarketOnChain(marketId);
+    currentFactoryMarketCache.set(marketId, {
+      checkedAt: Date.now(),
+      conditionId: stored?.conditionId
+    });
+    return stored?.conditionId;
+  } catch {
+    currentFactoryMarketCache.set(marketId, {
+      checkedAt: Date.now(),
+      conditionId: undefined
+    });
+    return undefined;
+  }
+}
+
+async function mapWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T) => Promise<void>
+): Promise<void> {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      const item = items[index];
+      if (item !== undefined) await mapper(item);
+    }
+  });
+  await Promise.all(workers);
+}
+
+function isSupportedFixtureCardMarket(fixture: Fixture, market: MarketDefinition): boolean {
+  if (fixture.sport !== "football" || fixture.competition?.name !== "Friendlies") return true;
+  if (market.type === "TOTAL_GOALS" || market.type === "BOTH_TEAMS_TO_SCORE") return true;
+  return market.resolver?.rule === "HOME_TEAM_WIN"
+    || market.resolver?.rule === "DRAW"
+    || market.resolver?.rule === "AWAY_TEAM_WIN";
 }
 
 function refreshStoredOrderStatus(

@@ -22,6 +22,9 @@ export async function fillWithHouseLiquidity(
   if (takerOrder.side !== "BUY") {
     return { attempted: true, matched: false, reason: "House liquidity currently supports BUY orders only" };
   }
+  if (isHouseWallet(takerOrder.order.maker)) {
+    return { attempted: true, matched: false, reason: "House liquidity skipped because the taker is the house wallet" };
+  }
 
   const market = store.getMarket(takerOrder.marketId);
   if (!market || market.status !== "open" || market.tradingStatus !== "open") {
@@ -132,6 +135,10 @@ function housePrivateKey(): Hex {
   const key = env.HOUSE_LIQUIDITY_PRIVATE_KEY || env.PRIVATE_KEY;
   if (!key) throw new Error("HOUSE_LIQUIDITY_PRIVATE_KEY or PRIVATE_KEY is required for house liquidity");
   return key as Hex;
+}
+
+function isHouseWallet(address: string): boolean {
+  return privateKeyToAccount(housePrivateKey()).address.toLowerCase() === address.toLowerCase();
 }
 
 function maxHouseOrderAmount(): bigint {
