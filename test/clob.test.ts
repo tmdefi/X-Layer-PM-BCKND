@@ -1029,6 +1029,8 @@ test("market data routes expose frontend prices, ticks, summaries, and candles",
 
 test("market summary list and card feed batch frontend snippets", async () => {
   const store = marketStore();
+  const futureKickoff = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  const liveKickoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
   store.upsertFixture({
     id: "fixture-1",
     sport: "football",
@@ -1036,7 +1038,7 @@ test("market summary list and card feed batch frontend snippets", async () => {
     competition: { kind: "league", id: "premier-league", name: "Premier League", season: "2026" },
     homeCompetitor: "Home FC",
     awayCompetitor: "Away FC",
-    kickoffTime: "2026-05-22T18:00:00.000Z",
+    kickoffTime: futureKickoff,
     status: "scheduled"
   });
   store.upsertMarket(createYesNoMarket({
@@ -1068,7 +1070,7 @@ test("market summary list and card feed batch frontend snippets", async () => {
     competition: { kind: "league", id: "champions-league", name: "Champions League", season: "2026" },
     homeCompetitor: "Live FC",
     awayCompetitor: "Away Town",
-    kickoffTime: "2026-05-23T18:00:00.000Z",
+    kickoffTime: liveKickoff,
     status: "live"
   });
   store.upsertMarket(createYesNoMarket({
@@ -1113,7 +1115,7 @@ test("market summary list and card feed batch frontend snippets", async () => {
   const [summaries, cards, kickoffPage, volume, activity, search, playerCards, standalone, competition] = await Promise.all([
     app.inject({ method: "GET", url: "/markets/summaries?status=open&limit=10" }),
     app.inject({ method: "GET", url: "/markets/cards?sort=live_status" }),
-    app.inject({ method: "GET", url: "/markets/cards?sort=kickoff_time&offset=2&limit=1" }),
+    app.inject({ method: "GET", url: "/markets/cards?sort=kickoff_time&offset=0&limit=1" }),
     app.inject({ method: "GET", url: "/markets/summaries?sort=volume&limit=1" }),
     app.inject({ method: "GET", url: "/markets/summaries?sort=newest_activity&limit=1" }),
     app.inject({ method: "GET", url: "/markets/summaries?q=Away%20Town&provider=test&fixtureStatus=live" }),
@@ -1135,7 +1137,7 @@ test("market summary list and card feed batch frontend snippets", async () => {
   assert.equal(kickoffPage.json().cards[0].fixture.id, "fixture-2");
   assert.equal(kickoffPage.json().pagination.total, 4);
   assert.equal(kickoffPage.json().pagination.hasMore, true);
-  assert.equal(kickoffPage.json().pagination.nextOffset, 3);
+  assert.equal(kickoffPage.json().pagination.nextOffset, 1);
   assert.equal(volume.json().summaries[0].market.id, "live-market");
   assert.equal(activity.json().summaries[0].market.id, "live-market");
   assert.equal(search.json().summaries.length, 1);

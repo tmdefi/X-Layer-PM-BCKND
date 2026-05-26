@@ -1755,6 +1755,7 @@ function filteredMarkets(
     competitionName?: string | undefined;
   }
 ) {
+  const now = Date.now();
   return store.listMarkets()
     .filter((market) => !query.fixtureId || market.fixtureId === query.fixtureId)
     .filter((market) => !query.status || market.status === query.status)
@@ -1776,6 +1777,7 @@ function filteredMarkets(
       if (!market.fixtureId) return false;
       return store.getFixture(market.fixtureId)?.status === query.fixtureStatus;
     })
+    .filter((market) => market.status !== "open" || isCurrentOpenFixtureMarket(store, market, now))
     .filter((market) => {
       if (!query.competitionId) return true;
       if (market.template?.category === "PLAYER_FUTURE") {
@@ -1794,6 +1796,20 @@ function filteredMarkets(
         .includes(query.competitionName.toLowerCase()) ?? false;
     })
     .filter((market) => !query.q || matchesDiscoverySearch(store, market, query.q));
+}
+
+const STALE_SCHEDULED_FIXTURE_GRACE_MS = 2 * 60 * 60 * 1000;
+const STALE_LIVE_FIXTURE_GRACE_MS = 24 * 60 * 60 * 1000;
+
+function isCurrentOpenFixtureMarket(store: InMemoryStore, market: MarketDefinition, now: number): boolean {
+  if (!market.fixtureId || market.template?.category === "PLAYER_FUTURE") return true;
+  const fixture = store.getFixture(market.fixtureId);
+  if (!fixture) return false;
+  const kickoffTime = Date.parse(fixture.kickoffTime);
+  if (!Number.isFinite(kickoffTime)) return false;
+  if (fixture.status === "scheduled") return kickoffTime >= now - STALE_SCHEDULED_FIXTURE_GRACE_MS;
+  if (fixture.status === "live") return kickoffTime >= now - STALE_LIVE_FIXTURE_GRACE_MS;
+  return false;
 }
 
 type MarketDiscoverySort = {
