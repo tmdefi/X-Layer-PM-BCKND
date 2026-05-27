@@ -1631,7 +1631,7 @@ function exportPage(state: "ready" | "expired", address = "") {
       </section>
       <label class="confirm">
         <input id="confirm" type="checkbox" />
-        <span>I understand that X Cup cannot recover funds if I share or lose this key.</span>
+        <span>I understand that Xsporty cannot recover funds if I share or lose this key.</span>
       </label>
       <button id="reveal" disabled>Reveal private key</button>
       <pre id="output" hidden></pre>

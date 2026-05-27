@@ -52,7 +52,7 @@ export async function getOrCreatePrivyTelegramWallet(input: TelegramIdentity): P
         }
       ],
       custom_metadata: {
-        source: "x-cup-markets-telegram"
+        source: "xsporty-telegram"
       },
       wallets: [walletCreationInput()]
     });
