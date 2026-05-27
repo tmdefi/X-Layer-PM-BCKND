@@ -291,6 +291,11 @@ export const telegramClaimWinningsSchema = telegramUserSchema.extend({
   marketId: z.string().min(1)
 });
 
+export const telegramWithdrawalSchema = telegramUserSchema.extend({
+  destination: addressSchema,
+  amount: uintStringSchema.refine((value) => BigInt(value) > 0n, "amount must be positive")
+});
+
 export const portfolioQuerySchema = z.object({
   marketIds: z.string().min(1).optional().transform((value) =>
     value?.split(",").map((id) => id.trim()).filter(Boolean)

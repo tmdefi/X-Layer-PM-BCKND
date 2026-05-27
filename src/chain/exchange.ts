@@ -531,6 +531,18 @@ export function incrementNonceTransaction() {
   };
 }
 
+export function collateralTransferTransaction(to: Address, amount: string) {
+  const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+  return {
+    to: collateral,
+    data: encodeFunctionData({
+      abi: erc20CollateralAbi,
+      functionName: "transfer",
+      args: [to, BigInt(amount)]
+    })
+  };
+}
+
 function collateralApprovalTransaction(collateral: Address, exchange: Address) {
   return {
     to: collateral,

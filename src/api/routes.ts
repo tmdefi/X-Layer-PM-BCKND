@@ -14,6 +14,7 @@ import {
   requireAddress,
   hashIdentifier,
   incrementNonceTransaction,
+  collateralTransferTransaction,
   outcomeSideToResolverOutcome,
   prepareExchangeOrder,
   redemptionTransaction,
@@ -103,13 +104,14 @@ import {
   portfolioQuerySchema,
   providerFixtureResultSchema,
   sourceFixtureQuerySchema,
-    submitClobOrderSchema,
-    submitMarketResolutionOnChainSchema,
-    telegramClaimWinningsSchema,
-    telegramPlaceOrderSchema,
-    telegramUserSchema,
-    tickClobMatcherSchema
-  } from "./schemas.js";
+  submitClobOrderSchema,
+  submitMarketResolutionOnChainSchema,
+  telegramClaimWinningsSchema,
+  telegramPlaceOrderSchema,
+  telegramUserSchema,
+  telegramWithdrawalSchema,
+  tickClobMatcherSchema
+} from "./schemas.js";
 
 export type ClobRouteChain = {
   getMarketOnChain: typeof getMarketOnChain;
@@ -117,6 +119,7 @@ export type ClobRouteChain = {
   validateExchangeOrder: typeof validateExchangeOrder;
   getAccountPortfolioBalances: typeof getAccountPortfolioBalances;
   redemptionTransaction: typeof redemptionTransaction;
+  collateralTransferTransaction: typeof collateralTransferTransaction;
 };
 
 const defaultClobRouteChain: ClobRouteChain = {
@@ -124,7 +127,8 @@ const defaultClobRouteChain: ClobRouteChain = {
   getExchangeOrderReadiness,
   validateExchangeOrder,
   getAccountPortfolioBalances,
-  redemptionTransaction
+  redemptionTransaction,
+  collateralTransferTransaction
 };
 
 const EXPORT_TOKEN_TTL_MS = 5 * 60 * 1000;
@@ -1187,6 +1191,45 @@ export async function registerRoutes(
         side: outcome.outcome.side,
         balance: outcome.balance
       }))
+    });
+  });
+
+  app.post("/telegram/withdrawals", {
+    preHandler: requireTelegramBotApiKey
+  }, async (request, reply) => {
+    const input = telegramWithdrawalSchema.parse(request.body);
+    const wallet = await getOrCreatePrivyTelegramWallet(input);
+    const balances = await clobChain.getAccountPortfolioBalances(wallet.address, []);
+    const balance = BigInt(balances.collateral.balance);
+    const amount = BigInt(input.amount);
+    if (amount > balance) {
+      return reply.code(400).send({
+        error: "Insufficient USDC balance",
+        wallet,
+        collateral: balances.collateral
+      });
+    }
+
+    const tx = clobChain.collateralTransferTransaction(input.destination as Address, input.amount);
+    const transactionHash = await sendPrivyTransaction(wallet.walletId, tx);
+    const receipt = await createPublicChainClient().waitForTransactionReceipt({ hash: transactionHash });
+    if (receipt.status !== "success") {
+      return reply.code(400).send({ error: "Withdrawal transaction failed", wallet, transactionHash });
+    }
+
+    request.log.info({
+      telegramUserId: input.telegramUserId,
+      wallet: wallet.address,
+      destination: input.destination,
+      amount: input.amount,
+      transactionHash
+    }, "Withdrew Telegram Privy USDC");
+
+    return reply.code(201).send({
+      wallet,
+      destination: input.destination,
+      amount: input.amount,
+      transactionHash
     });
   });
 

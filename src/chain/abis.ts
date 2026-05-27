@@ -175,6 +175,16 @@ export const erc20CollateralAbi = [
       { name: "amount", type: "uint256" }
     ],
     outputs: [{ name: "", type: "bool" }]
+  },
+  {
+    type: "function",
+    name: "transfer",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" }
+    ],
+    outputs: [{ name: "", type: "bool" }]
   }
 ] as const;
 
