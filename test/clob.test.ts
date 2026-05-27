@@ -113,6 +113,33 @@ test("wallet config exposes X Layer connection data without backend secrets", as
   await app.close();
 });
 
+test("Telegram wallet routes require bot API key before Privy access", async () => {
+  const previous = env.TELEGRAM_BOT_API_KEY;
+  env.TELEGRAM_BOT_API_KEY = "test-telegram-bot-key";
+  try {
+    const app = await testApp(marketStore(), readyClobChain());
+
+    const unauthorized = await app.inject({
+      method: "POST",
+      url: "/telegram/wallet",
+      payload: { telegramUserId: "12345" }
+    });
+    assert.equal(unauthorized.statusCode, 401);
+
+    const configured = await app.inject({
+      method: "POST",
+      url: "/telegram/wallet",
+      headers: { "x-telegram-bot-api-key": "test-telegram-bot-key" },
+      payload: { telegramUserId: "12345" }
+    });
+    assert.equal(configured.statusCode, 503);
+
+    await app.close();
+  } finally {
+    env.TELEGRAM_BOT_API_KEY = previous;
+  }
+});
+
 test("signed order submission rejects missing balance or approval before signature validation", async () => {
   const store = marketStore();
   let validateCalled = false;

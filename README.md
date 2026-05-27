@@ -145,6 +145,37 @@ Recommended Railway setup:
 
 For production-like testnet behavior, use `HOST=0.0.0.0`, keep `PORT` unset so Railway can inject it, and only enable `SETTLEMENT_SUBMIT_ON_CHAIN=true` when the backend wallet is funded and intended to submit resolver transactions.
 
+## Telegram Privy Wallets
+
+The backend can expose protected Telegram-bot routes that create Privy Ethereum wallets and place CLOB orders from those wallets. These routes are intended for the Telegram bot service only; do not call them directly from a public client.
+
+Required env vars:
+
+```env
+TELEGRAM_BOT_API_KEY=
+PRIVY_SERVER_WALLETS_ENABLED=true
+PRIVY_APP_ID=
+PRIVY_APP_SECRET=
+PRIVY_WALLET_SIGNER_ID=
+PRIVY_WALLET_AUTHORIZATION_PRIVATE_KEY=
+PRIVY_WALLET_POLICY_ID=
+```
+
+Bot requests must include:
+
+```text
+x-telegram-bot-api-key: <TELEGRAM_BOT_API_KEY>
+```
+
+Routes:
+
+```text
+POST /telegram/wallet
+POST /telegram/orders
+```
+
+`/telegram/wallet` imports or finds the Telegram user in Privy and returns the user's deposit wallet address. `/telegram/orders` checks balance/approval, submits a Privy approval transaction if required, signs the CLOB EIP-712 order with Privy, and submits it into the backend CLOB.
+
 ## Wallet Connection
 
 The frontend can bootstrap wallet connection from the public backend config route:

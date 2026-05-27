@@ -18,6 +18,22 @@ export async function requireClobOperatorApiKey(request: FastifyRequest, reply: 
   }
 }
 
+export async function requireTelegramBotApiKey(request: FastifyRequest, reply: FastifyReply) {
+  if (!env.TELEGRAM_BOT_API_KEY) {
+    request.log.error({ route: request.routeOptions.url }, "Telegram bot API key is not configured");
+    return reply.code(503).send({ error: "Telegram bot API key is not configured" });
+  }
+
+  const provided = headerValue(request.headers["x-telegram-bot-api-key"]);
+  if (!provided || !constantTimeEqual(provided, env.TELEGRAM_BOT_API_KEY)) {
+    request.log.warn(
+      { route: request.routeOptions.url, ip: request.ip },
+      "Rejected Telegram bot request"
+    );
+    return reply.code(401).send({ error: "Invalid Telegram bot API key" });
+  }
+}
+
 function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }

@@ -1,5 +1,5 @@
 import type { FastifyInstance } from "fastify";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { Address, Hex } from "viem";
 import {
   cancellationTransaction,
@@ -9,6 +9,9 @@ import {
   getExchangeOrderReadiness,
   getAccountPortfolioBalances,
   getMarketOnChain,
+  marketUsesCurrentCollateral,
+  createPublicChainClient,
+  requireAddress,
   hashIdentifier,
   incrementNonceTransaction,
   outcomeSideToResolverOutcome,
@@ -54,7 +57,14 @@ import {
   operatorTransactionRetryPolicy,
   runTrackedOperatorTransaction
 } from "./operator-transactions.js";
-import { requireClobOperatorApiKey } from "./security.js";
+import { requireClobOperatorApiKey, requireTelegramBotApiKey } from "./security.js";
+import {
+  exportPrivyWalletPrivateKey,
+  getOrCreateExportablePrivyTelegramWallet,
+  getOrCreatePrivyTelegramWallet,
+  sendPrivyTransaction,
+  signPrivyTypedData
+} from "../wallets/privy.js";
 import {
   autoMatchOrder,
   buildOrderbook,
@@ -93,10 +103,13 @@ import {
   portfolioQuerySchema,
   providerFixtureResultSchema,
   sourceFixtureQuerySchema,
-  submitClobOrderSchema,
-  submitMarketResolutionOnChainSchema,
-  tickClobMatcherSchema
-} from "./schemas.js";
+    submitClobOrderSchema,
+    submitMarketResolutionOnChainSchema,
+    telegramClaimWinningsSchema,
+    telegramPlaceOrderSchema,
+    telegramUserSchema,
+    tickClobMatcherSchema
+  } from "./schemas.js";
 
 export type ClobRouteChain = {
   getMarketOnChain: typeof getMarketOnChain;
@@ -113,6 +126,14 @@ const defaultClobRouteChain: ClobRouteChain = {
   getAccountPortfolioBalances,
   redemptionTransaction
 };
+
+const EXPORT_TOKEN_TTL_MS = 5 * 60 * 1000;
+const exportTokens = new Map<string, {
+  walletId: string;
+  address: Address;
+  telegramUserId: string;
+  expiresAt: number;
+}>();
 
 export async function registerRoutes(
   app: FastifyInstance,
@@ -944,6 +965,231 @@ export async function registerRoutes(
     };
   });
 
+  app.post("/telegram/wallet", {
+    preHandler: requireTelegramBotApiKey
+  }, async (request, reply) => {
+    const input = telegramUserSchema.parse(request.body);
+    const wallet = await getOrCreatePrivyTelegramWallet(input);
+    return reply.code(201).send({ wallet });
+  });
+
+  app.post("/telegram/export-link", {
+    preHandler: requireTelegramBotApiKey
+  }, async (request, reply) => {
+    const input = telegramUserSchema.parse(request.body);
+    const wallet = await getOrCreateExportablePrivyTelegramWallet(input);
+    pruneExportTokens();
+    const token = randomBytes(32).toString("base64url");
+    exportTokens.set(token, {
+      walletId: wallet.walletId,
+      address: wallet.address,
+      telegramUserId: input.telegramUserId,
+      expiresAt: Date.now() + EXPORT_TOKEN_TTL_MS
+    });
+
+    return reply.code(201).send({
+      wallet: {
+        address: wallet.address
+      },
+      expiresInSeconds: Math.floor(EXPORT_TOKEN_TTL_MS / 1000),
+      exportPath: `/wallet/export/${token}`
+    });
+  });
+
+  app.get<{ Params: { token: string } }>("/wallet/export/:token", async (request, reply) => {
+    const entry = getExportToken(request.params.token);
+    if (!entry) return reply.type("text/html; charset=utf-8").code(404).send(exportPage("expired"));
+    return reply
+      .header("Cache-Control", "no-store")
+      .type("text/html; charset=utf-8")
+      .send(exportPage("ready", entry.address));
+  });
+
+  app.post<{ Params: { token: string } }>("/wallet/export/:token/reveal", async (request, reply) => {
+    const entry = getExportToken(request.params.token);
+    if (!entry) return reply.code(404).send({ error: "Export link expired or already used" });
+
+    const privateKey = await exportPrivyWalletPrivateKey(entry.walletId);
+    exportTokens.delete(request.params.token);
+    request.log.warn({
+      telegramUserId: entry.telegramUserId,
+      wallet: entry.address
+    }, "Exported Telegram Privy wallet private key");
+
+    return reply
+      .header("Cache-Control", "no-store")
+      .code(200)
+      .send({
+        address: entry.address,
+        privateKey
+      });
+  });
+
+  app.post("/telegram/orders", {
+    preHandler: requireTelegramBotApiKey,
+    config: {
+      rateLimit: {
+        max: env.CLOB_ORDER_RATE_LIMIT_MAX,
+        timeWindow: env.CLOB_ORDER_RATE_LIMIT_WINDOW
+      }
+    }
+  }, async (request, reply) => {
+    const input = telegramPlaceOrderSchema.parse(request.body);
+    const market = store.getMarket(input.marketId);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+    if (!marketAcceptsOrders(market)) return reply.code(400).send({ error: marketTradingError(market) });
+
+    const wallet = await getOrCreatePrivyTelegramWallet(input);
+    let readiness = await clobChain.getExchangeOrderReadiness({
+      marketId: input.marketId,
+      outcomeSide: input.outcomeSide,
+      maker: wallet.address,
+      side: input.side,
+      makerAmount: input.makerAmount
+    });
+
+    let approvalHash: Hex | undefined;
+    if (!readiness.ready && readiness.asset.hasBalance && readiness.approval.transaction) {
+      approvalHash = await sendPrivyTransaction(wallet.walletId, readiness.approval.transaction);
+      const receipt = await createPublicChainClient().waitForTransactionReceipt({ hash: approvalHash });
+      if (receipt.status !== "success") {
+        return reply.code(400).send({ error: "Privy approval transaction failed", readiness, approvalHash });
+      }
+      readiness = await clobChain.getExchangeOrderReadiness({
+        marketId: input.marketId,
+        outcomeSide: input.outcomeSide,
+        maker: wallet.address,
+        side: input.side,
+        makerAmount: input.makerAmount
+      });
+    }
+
+    if (!readiness.ready) {
+      return reply.code(400).send({
+        error: "Privy wallet balance or exchange approval is not ready",
+        wallet,
+        readiness
+      });
+    }
+
+    const prepared = await prepareExchangeOrder({
+      marketId: input.marketId,
+      outcomeSide: input.outcomeSide,
+      maker: wallet.address,
+      side: input.side,
+      makerAmount: input.makerAmount,
+      takerAmount: input.takerAmount,
+      expiration: input.expiration,
+      feeRateBps: input.feeRateBps,
+      signatureType: 0
+    });
+    const signature = await signPrivyTypedData(wallet.walletId, prepared.typedData);
+    const signedOrder: ExchangeOrder = {
+      ...prepared.order,
+      signature
+    };
+    const orderHash = await clobChain.validateExchangeOrder(signedOrder);
+    const existing = store.getClobOrderByHash(orderHash);
+    if (existing) return reply.code(200).send({ wallet, order: existing, readiness, approvalHash, duplicate: true });
+
+    const now = new Date().toISOString();
+    const order: StoredClobOrder = {
+      id: randomUUID(),
+      orderHash,
+      marketId: market.id,
+      outcomeSide: input.outcomeSide,
+      order: signedOrder,
+      side: signedOrder.side === 0 ? "BUY" : "SELL",
+      remainingMaker: signedOrder.makerAmount,
+      status: "open",
+      createdAt: now,
+      updatedAt: now
+    };
+    const stored = store.upsertClobOrder(order);
+
+    let autoMatch;
+    try {
+      autoMatch = await autoMatchOrder(store, stored);
+      if (!autoMatch.matched) {
+        const houseMatch = await fillWithHouseLiquidity(store, store.getClobOrder(stored.id) ?? stored);
+        if (houseMatch.attempted) autoMatch = houseMatch;
+      }
+    } catch (error) {
+      request.log.warn({
+        marketId: market.id,
+        orderId: stored.id,
+        error: error instanceof Error ? error.message : "Unknown matcher error"
+      }, "Automatic CLOB matching failed after Telegram order acceptance");
+      autoMatch = {
+        attempted: true,
+        matched: false,
+        reason: error instanceof Error ? error.message : "Automatic matching failed"
+      };
+    }
+
+    request.log.info({
+      telegramUserId: input.telegramUserId,
+      marketId: market.id,
+      orderId: stored.id,
+      orderHash,
+      maker: wallet.address,
+      outcomeSide: input.outcomeSide,
+      side: input.side
+    }, "Accepted Telegram Privy CLOB order");
+
+    return reply.code(201).send({
+      wallet,
+      order: store.getClobOrder(stored.id) ?? stored,
+      readiness,
+      approvalHash,
+      autoMatch
+    });
+  });
+
+  app.post("/telegram/claims", {
+    preHandler: requireTelegramBotApiKey
+  }, async (request, reply) => {
+    const input = telegramClaimWinningsSchema.parse(request.body);
+    const market = store.getMarket(input.marketId);
+    if (!market) return reply.code(404).send({ error: "Market not found" });
+
+    const wallet = await getOrCreatePrivyTelegramWallet(input);
+    const positions = await loadPortfolioPositions(store, clobChain, wallet.address, [market.id]);
+    const position = positions.positions.find((item) => item.market.id === market.id);
+    const redeemableOutcomes = position?.outcomes.filter((outcome) => outcome.redeemable) ?? [];
+    if (!redeemableOutcomes.length) {
+      return reply.code(400).send({
+        error: "No redeemable winning position found for this market",
+        wallet,
+        position
+      });
+    }
+
+    const tx = await clobChain.redemptionTransaction(market.id);
+    const transactionHash = await sendPrivyTransaction(wallet.walletId, tx);
+    const receipt = await createPublicChainClient().waitForTransactionReceipt({ hash: transactionHash });
+    if (receipt.status !== "success") {
+      return reply.code(400).send({ error: "Claim transaction failed", wallet, market, transactionHash });
+    }
+
+    request.log.info({
+      telegramUserId: input.telegramUserId,
+      marketId: market.id,
+      wallet: wallet.address,
+      transactionHash
+    }, "Claimed Telegram Privy winnings");
+
+    return reply.code(201).send({
+      wallet,
+      market,
+      transactionHash,
+      redeemed: redeemableOutcomes.map((outcome) => ({
+        side: outcome.outcome.side,
+        balance: outcome.balance
+      }))
+    });
+  });
+
   app.post("/clob/orders", {
     config: {
       rateLimit: {
@@ -1348,6 +1594,108 @@ function hexChainId(chainId: number): Hex {
   return `0x${chainId.toString(16)}` as Hex;
 }
 
+function getExportToken(token: string) {
+  pruneExportTokens();
+  const entry = exportTokens.get(token);
+  if (!entry || entry.expiresAt < Date.now()) {
+    exportTokens.delete(token);
+    return undefined;
+  }
+  return entry;
+}
+
+function pruneExportTokens() {
+  const now = Date.now();
+  for (const [token, entry] of exportTokens) {
+    if (entry.expiresAt < now) exportTokens.delete(token);
+  }
+}
+
+function exportPage(state: "ready" | "expired", address = "") {
+  if (state === "expired") {
+    return htmlDocument("Export link expired", `
+      <main>
+        <h1>Export link expired</h1>
+        <p>This export link is invalid, expired, or already used. Return to Telegram and request a new export link.</p>
+      </main>
+    `);
+  }
+
+  return htmlDocument("Export wallet private key", `
+    <main>
+      <h1>Export wallet private key</h1>
+      <p class="address">${escapeHtml(address)}</p>
+      <section class="warning">
+        <strong>Anyone with this private key can control this wallet and move its funds.</strong>
+        <span>Only continue if you are alone, on a trusted device, and ready to store the key safely.</span>
+      </section>
+      <label class="confirm">
+        <input id="confirm" type="checkbox" />
+        <span>I understand that X Cup cannot recover funds if I share or lose this key.</span>
+      </label>
+      <button id="reveal" disabled>Reveal private key</button>
+      <pre id="output" hidden></pre>
+      <p id="status" role="status"></p>
+    </main>
+    <script>
+      const confirmBox = document.getElementById("confirm");
+      const reveal = document.getElementById("reveal");
+      const output = document.getElementById("output");
+      const status = document.getElementById("status");
+      confirmBox.addEventListener("change", () => { reveal.disabled = !confirmBox.checked; });
+      reveal.addEventListener("click", async () => {
+        reveal.disabled = true;
+        status.textContent = "Exporting...";
+        try {
+          const response = await fetch(location.pathname + "/reveal", { method: "POST" });
+          const body = await response.json();
+          if (!response.ok) throw new Error(body.error || "Export failed");
+          output.textContent = body.privateKey;
+          output.hidden = false;
+          status.textContent = "Private key shown once. Store it securely, then close this page.";
+        } catch (error) {
+          status.textContent = error instanceof Error ? error.message : "Export failed";
+          reveal.disabled = false;
+        }
+      });
+    </script>
+  `);
+}
+
+function htmlDocument(title: string, body: string) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex,nofollow" />
+  <title>${escapeHtml(title)}</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #080a0f; color: #f6f7fb; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+    main { width: min(100%, 620px); border: 1px solid #252b38; border-radius: 8px; padding: 24px; background: #10141d; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+    h1 { margin: 0 0 12px; font-size: 24px; line-height: 1.2; }
+    p { color: #bdc4d4; line-height: 1.5; }
+    .address { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: #dbeafe; }
+    .warning { display: grid; gap: 8px; margin: 20px 0; padding: 14px; border: 1px solid #7f1d1d; border-radius: 8px; background: #2a1114; color: #fecaca; line-height: 1.45; }
+    .confirm { display: flex; gap: 10px; align-items: flex-start; margin: 18px 0; color: #e5e7eb; line-height: 1.45; }
+    button { width: 100%; min-height: 44px; border: 0; border-radius: 6px; background: #e5e7eb; color: #111827; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    pre { margin-top: 18px; padding: 14px; border-radius: 6px; overflow-wrap: anywhere; white-space: pre-wrap; background: #06080d; color: #bbf7d0; border: 1px solid #1f2937; }
+  </style>
+</head>
+<body>${body}</body>
+</html>`;
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 async function submitResolutionOperatorTransaction(
   store: InMemoryStore,
   input: {
@@ -1624,6 +1972,21 @@ async function currentFactoryConditionId(marketId: string): Promise<string | und
 
   try {
     const stored = await getMarketOnChain(marketId);
+    if (stored && env.COLLATERAL_TOKEN_ADDRESS && env.CONDITIONAL_TOKENS_ADDRESS) {
+      const usesCurrentCollateral = await marketUsesCurrentCollateral(
+        createPublicChainClient(),
+        requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS"),
+        requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS"),
+        stored
+      );
+      if (!usesCurrentCollateral) {
+        currentFactoryMarketCache.set(marketId, {
+          checkedAt: Date.now(),
+          conditionId: undefined
+        });
+        return undefined;
+      }
+    }
     currentFactoryMarketCache.set(marketId, {
       checkedAt: Date.now(),
       conditionId: stored?.conditionId

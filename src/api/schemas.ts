@@ -269,6 +269,28 @@ export const tickClobMatcherSchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(25)
 });
 
+export const telegramUserSchema = z.object({
+  telegramUserId: z.string().trim().min(1).max(64),
+  username: z.string().trim().min(1).max(64).optional(),
+  firstName: z.string().trim().min(1).max(120).optional(),
+  lastName: z.string().trim().min(1).max(120).optional(),
+  photoUrl: z.string().url().optional()
+});
+
+export const telegramPlaceOrderSchema = telegramUserSchema.extend({
+  marketId: z.string().min(1),
+  outcomeSide: binaryOutcomeSideSchema,
+  side: clobOrderSideSchema,
+  makerAmount: uintStringSchema.refine((value) => BigInt(value) > 0n, "makerAmount must be positive"),
+  takerAmount: uintStringSchema.refine((value) => BigInt(value) > 0n, "takerAmount must be positive"),
+  expiration: uintStringSchema.optional(),
+  feeRateBps: uintStringSchema.optional()
+});
+
+export const telegramClaimWinningsSchema = telegramUserSchema.extend({
+  marketId: z.string().min(1)
+});
+
 export const portfolioQuerySchema = z.object({
   marketIds: z.string().min(1).optional().transform((value) =>
     value?.split(",").map((id) => id.trim()).filter(Boolean)

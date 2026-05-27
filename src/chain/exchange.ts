@@ -318,7 +318,7 @@ export async function redemptionTransaction(marketId: string) {
   };
 }
 
-async function marketUsesCurrentCollateral(
+export async function marketUsesCurrentCollateral(
   publicClient: ReturnType<typeof createPublicChainClient>,
   conditionalTokens: Address,
   collateral: Address,
