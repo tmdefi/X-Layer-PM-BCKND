@@ -27,6 +27,7 @@ import { env } from "../config/env.js";
 import {
   MAIN_CARD_PLAYER_MARKET_TEMPLATES,
   PLAYER_MARKET_TEMPLATES,
+  PLAYER_TOURNAMENT_FUTURE_OVER_LINES,
   PLAYER_TOURNAMENT_FUTURE_TEMPLATES,
   createBasketballFixtureMarkets,
   createEsportsFixtureMarkets,
@@ -200,7 +201,8 @@ export async function registerRoutes(
     templates: PLAYER_TOURNAMENT_FUTURE_TEMPLATES.map(({ template, label, requiresLine }) => ({
       template,
       label,
-      requiresLine
+      requiresLine,
+      ...(requiresLine ? { lineOptions: PLAYER_TOURNAMENT_FUTURE_OVER_LINES } : {})
     }))
   }));
 
@@ -685,7 +687,11 @@ export async function registerRoutes(
     preHandler: requireClobOperatorApiKey
   }, async (request, reply) => {
     const input = createPlayerTournamentFuturesSchema.parse(request.body ?? {});
-    const markets = input.markets.map((market) =>
+    const marketsWithImages = await Promise.all(input.markets.map(async (market) => ({
+      ...market,
+      imageUrl: market.imageUrl ?? await lookupSportsDbPlayerImage(market.playerName)
+    })));
+    const markets = marketsWithImages.map((market) =>
       createPlayerTournamentFutureMarket({
         provider: input.provider,
         competition: input.competition,
@@ -811,6 +817,10 @@ export async function registerRoutes(
       conditionId: result.conditionId ?? market.conditionId
     };
     store.upsertMarket(updatedMarket);
+    currentFactoryMarketCache.set(market.id, {
+      checkedAt: Date.now(),
+      conditionId: updatedMarket.conditionId
+    });
 
     return reply.code(201).send({
       market: updatedMarket,
@@ -2040,6 +2050,28 @@ async function currentFactoryConditionId(marketId: string): Promise<string | und
       checkedAt: Date.now(),
       conditionId: undefined
     });
+    return undefined;
+  }
+}
+
+async function lookupSportsDbPlayerImage(playerName: string): Promise<string | undefined> {
+  try {
+    const url = `https://www.thesportsdb.com/api/v1/json/123/searchplayers.php?p=${encodeURIComponent(playerName)}`;
+    const response = await fetch(url, { signal: AbortSignal.timeout(2500) });
+    if (!response.ok) return undefined;
+    const body = await response.json() as {
+      player?: Array<{
+        strPlayer?: string | null;
+        strCutout?: string | null;
+        strThumb?: string | null;
+        strRender?: string | null;
+      }> | null;
+    };
+    const players = body.player ?? [];
+    const exactMatch = players.find((player) => player.strPlayer?.toLowerCase() === playerName.toLowerCase());
+    const player = exactMatch ?? players[0];
+    return player?.strCutout ?? player?.strThumb ?? player?.strRender ?? undefined;
+  } catch {
     return undefined;
   }
 }

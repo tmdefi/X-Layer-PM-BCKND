@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PLAYER_TOURNAMENT_FUTURE_OVER_LINES } from "../markets/definitions.js";
 
 export const sportSchema = z.enum(["football", "basketball", "american_football", "esports", "mma"]);
 
@@ -24,6 +25,7 @@ export const playerTournamentFutureTemplateSchema = z.enum([
   "TOURNAMENT_FOULS_OVER",
   "TOURNAMENT_FREE_KICK_GOAL"
 ]);
+export const playerTournamentFutureOverLineSchema = z.enum(PLAYER_TOURNAMENT_FUTURE_OVER_LINES);
 export const teamSideSchema = z.enum(["home", "away"]);
 
 export const playerIdentityInputSchema = z.object({
@@ -138,7 +140,7 @@ export const createPlayerTournamentFuturesSchema = z.object({
         teamName: z.string().min(1).optional(),
         imageUrl: z.string().url().optional(),
         template: playerTournamentFutureTemplateSchema,
-        line: z.string().regex(/^\d+(?:\.\d+)?$/, "Expected numeric line").optional()
+        line: playerTournamentFutureOverLineSchema.optional()
       })
     )
     .min(1)

@@ -20,6 +20,7 @@ import type {
 } from "./types.js";
 
 export const DEFAULT_TOTAL_GOALS_LINES = ["0.5", "1.5", "2.5", "3.5"] as const;
+export const PLAYER_TOURNAMENT_FUTURE_OVER_LINES = ["3.5", "4.5", "5.5"] as const;
 
 export const PLAYER_MARKET_TEMPLATES = [
   {
@@ -410,6 +411,9 @@ export function createPlayerTournamentFutureMarket(input: {
   if (template.requiresLine && !input.line) {
     throw new Error(`Tournament future template ${input.template} requires a line`);
   }
+  if (template.requiresLine && input.line && !isPlayerTournamentFutureOverLine(input.line)) {
+    throw new Error(`Tournament future template ${input.template} line must be one of ${PLAYER_TOURNAMENT_FUTURE_OVER_LINES.join(", ")}`);
+  }
   const playerSlug = slugify(input.playerName);
   const templateSlug = input.template.toLowerCase().replaceAll("_", "-");
   const competitionSlug = slugify(`${input.competition.name}-${input.competition.season ?? input.competition.id ?? ""}`);
@@ -497,6 +501,10 @@ function playerTournamentFutureTemplate(template: PlayerTournamentFutureTemplate
   }
 
   return found;
+}
+
+function isPlayerTournamentFutureOverLine(line: string): boolean {
+  return (PLAYER_TOURNAMENT_FUTURE_OVER_LINES as readonly string[]).includes(line);
 }
 
 function slugify(value: string): string {

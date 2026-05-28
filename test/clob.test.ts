@@ -1229,6 +1229,31 @@ test("player future markets are discoverable and resolve from tournament aggrega
   await app.close();
 });
 
+test("player future over lines are constrained to 3.5 through 5.5", () => {
+  const baseInput = {
+    provider: "api-football",
+    competition: {
+      kind: "league" as const,
+      id: "1",
+      name: "World Cup",
+      season: "2026"
+    },
+    playerId: "278",
+    playerName: "Kylian Mbappe",
+    teamName: "France",
+    template: "TOURNAMENT_GOALS_OVER" as const,
+    status: "open" as const
+  };
+
+  for (const line of ["3.5", "4.5", "5.5"]) {
+    assert.equal(createPlayerTournamentFutureMarket({ ...baseInput, line }).template?.category, "PLAYER_FUTURE");
+  }
+  assert.throws(
+    () => createPlayerTournamentFutureMarket({ ...baseInput, line: "2.5" }),
+    /line must be one of 3.5, 4.5, 5.5/
+  );
+});
+
 async function testApp(store: InMemoryStore, clobChain: ClobRouteChain) {
   const app = Fastify({ logger: false });
   await registerRoutes(app, store, new SourceRegistry(), undefined, undefined, clobChain);
