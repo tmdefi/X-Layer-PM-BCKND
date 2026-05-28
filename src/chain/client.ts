@@ -36,7 +36,7 @@ export function requireAddress(value: string | undefined, name: string): Address
 export function xLayerChain() {
   return {
     id: env.XLAYER_CHAIN_ID,
-    name: env.XLAYER_CHAIN_ID === 196 ? "X Layer" : "X Layer Testnet",
+    name: env.XLAYER_CHAIN_ID === 196 ? "X Layer" : "X Layer Custom",
     nativeCurrency: {
       name: "OKB",
       symbol: "OKB",

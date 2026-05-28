@@ -143,7 +143,7 @@ Recommended Railway setup:
 4. Run `npm run prisma:deploy` once after Postgres is attached and the database env vars are present.
 5. Add the X Layer, contract, provider API, and operator env vars from `.env.example`.
 
-For production-like testnet behavior, use `HOST=0.0.0.0`, keep `PORT` unset so Railway can inject it, and only enable `SETTLEMENT_SUBMIT_ON_CHAIN=true` when the backend wallet is funded and intended to submit resolver transactions.
+For production behavior, use `HOST=0.0.0.0`, keep `PORT` unset so Railway can inject it, and only enable `SETTLEMENT_SUBMIT_ON_CHAIN=true` when the backend wallet is funded and intended to submit resolver transactions.
 
 ## Telegram Privy Wallets
 

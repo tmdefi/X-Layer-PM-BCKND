@@ -12,27 +12,35 @@ type Artifact = {
 
 const artifactRoot = process.env.CTF_ARTIFACT_ROOT
   ?? join(process.cwd(), "..", "ctf-exchange-main", "out");
+const legacyArtifactRoot = process.env.CTF_LEGACY_ARTIFACT_ROOT
+  ?? join(process.cwd(), "..", "ctf-exchange-main", "artifacts");
 
 const exchangeArtifact = readArtifact("CTFExchange.sol", "CTFExchange.json");
 const resolverArtifact = readArtifact("BinaryMarketResolver.sol", "BinaryMarketResolver.json");
 const factoryArtifact = readArtifact("MarketFactory.sol", "MarketFactory.json");
+const conditionalTokensArtifact = readLegacyArtifact("ConditionalTokens.json");
 
 const privateKey = env.PRIVATE_KEY as Hex | undefined;
 if (!privateKey) throw new Error("PRIVATE_KEY is required to deploy the new USDC stack");
 
 const collateral = requireConfiguredAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
-const conditionalTokens = requireConfiguredAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
 const admin = requireConfiguredAddress(env.ADMIN_ADDRESS, "ADMIN_ADDRESS");
 const account = privateKeyToAccount(privateKey);
 const chain = {
   id: env.XLAYER_CHAIN_ID,
-  name: env.XLAYER_CHAIN_ID === 196 ? "X Layer" : "X Layer Testnet",
+  name: env.XLAYER_CHAIN_ID === 196 ? "X Layer" : "X Layer Custom",
   nativeCurrency: { name: "OKB", symbol: "OKB", decimals: 18 },
   rpcUrls: { default: { http: [env.XLAYER_RPC_URL] } }
 } as const;
 const publicClient = createPublicClient({ chain, transport: http(env.XLAYER_RPC_URL) });
 const walletClient = createWalletClient({ account, chain, transport: http(env.XLAYER_RPC_URL) });
 
+const conditionalTokens = await existingOrDeploy(
+  "ConditionalTokens",
+  env.CONDITIONAL_TOKENS_ADDRESS,
+  conditionalTokensArtifact,
+  []
+);
 const exchange = await deploy("CTFExchange", exchangeArtifact, [collateral, conditionalTokens]);
 await write("CTFExchange.addAdmin", exchange, exchangeArtifact.abi, "addAdmin", [admin]);
 await write("CTFExchange.addOperator", exchange, exchangeArtifact.abi, "addOperator", [admin]);
@@ -54,6 +62,27 @@ console.log(JSON.stringify({
 
 function readArtifact(directory: string, file: string): Artifact {
   return JSON.parse(readFileSync(join(artifactRoot, directory, file), "utf8")) as Artifact;
+}
+
+function readLegacyArtifact(file: string): Artifact {
+  return JSON.parse(readFileSync(join(legacyArtifactRoot, file), "utf8")) as Artifact;
+}
+
+async function existingOrDeploy(
+  name: string,
+  configuredAddress: string | undefined,
+  artifact: Artifact,
+  args: readonly unknown[]
+): Promise<Address> {
+  if (!configuredAddress) return deploy(name, artifact, args);
+  const address = configuredAddress as Address;
+  const code = await publicClient.getCode({ address });
+  if (!code || code === "0x") {
+    console.warn(`${name} address ${address} has no bytecode; deploying a new ${name}`);
+    return deploy(name, artifact, args);
+  }
+  console.log(`${name} already deployed at ${address}; reusing it`);
+  return address;
 }
 
 async function deploy(name: string, artifact: Artifact, args: readonly unknown[]): Promise<Address> {
