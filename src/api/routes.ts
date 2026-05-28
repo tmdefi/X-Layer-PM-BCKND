@@ -774,8 +774,9 @@ export async function registerRoutes(
     const markets = filteredMarkets(store, query);
     const cards = sortedMarketSummaryCards(buildMarketSummaryCards(store, markets), query);
     const page = pageItems(cards, query);
+    const checkedCards = await markCardsMissingCurrentFactoryMarkets(page.items);
     return {
-      cards: await markCardsMissingCurrentFactoryMarkets(page.items),
+      cards: filterCardsByRequestedTradingStatus(checkedCards, query.tradingStatus),
       pagination: page.pagination,
       sort: discoverySort(query)
     };
@@ -2015,6 +2016,25 @@ async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<stri
     });
     return { ...card, summaries };
   }) as T;
+}
+
+function filterCardsByRequestedTradingStatus<T extends Array<Record<string, unknown>>>(
+  cards: T,
+  tradingStatus: MarketDefinition["tradingStatus"] | undefined
+): T {
+  if (!tradingStatus) return cards;
+
+  return cards
+    .map((card) => {
+      if (!Array.isArray(card.summaries)) return card;
+      const summaries = card.summaries.filter((summary) => {
+        if (!summary || typeof summary !== "object" || !("market" in summary)) return false;
+        const market = (summary as { market?: MarketDefinition }).market;
+        return market?.tradingStatus === tradingStatus;
+      });
+      return { ...card, summaries };
+    })
+    .filter((card) => !Array.isArray(card.summaries) || card.summaries.length > 0) as T;
 }
 
 async function currentFactoryConditionId(marketId: string): Promise<string | undefined> {

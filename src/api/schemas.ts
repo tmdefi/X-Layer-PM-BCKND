@@ -318,6 +318,7 @@ export const marketListQuerySchema = z.object({
   fixtureId: z.string().min(1).optional(),
   sport: sportSchema.optional(),
   status: marketStatusSchema.optional(),
+  tradingStatus: marketTradingStatusSchema.optional(),
   provider: z.string().trim().min(1).max(80).optional(),
   fixtureStatus: fixtureStatusSchema.optional(),
   marketType: marketTypeSchema.optional(),
