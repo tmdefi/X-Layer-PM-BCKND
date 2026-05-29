@@ -34,6 +34,7 @@ const envSchema = z.object({
   CTF_EXCHANGE_ADDRESS: optionalAddressSchema,
   MARKET_FACTORY_ADDRESS: optionalAddressSchema,
   BINARY_MARKET_RESOLVER_ADDRESS: optionalAddressSchema,
+  MARKET_QUESTION_ID_SALT: z.string().optional().default(""),
   CLOB_OPERATOR_API_KEY: z.string().min(16).optional().or(z.literal("")),
   CLOB_ORDER_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(10_000).default(60),
   CLOB_ORDER_RATE_LIMIT_WINDOW: z.string().min(1).default("1 minute"),

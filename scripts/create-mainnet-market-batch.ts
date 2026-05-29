@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { Client } from "pg";
-import { createMarketOnChain, getMarketOnChain } from "../src/chain/markets.js";
+import { createMarketOnChain, getMarketOnChain, marketQuestionId } from "../src/chain/markets.js";
 
 type Candidate = {
   id: string;
@@ -12,6 +12,10 @@ type Candidate = {
 const limit = positiveInt(process.env.CREATE_MAINNET_MARKET_LIMIT, 25);
 const liveGraceHours = positiveInt(process.env.CREATE_MAINNET_LIVE_GRACE_HOURS, 6);
 const cancelStaleOrders = process.env.CREATE_MAINNET_CANCEL_STALE_ORDERS === "true";
+const sportFilter = optionalFilter(process.env.CREATE_MAINNET_MARKET_SPORT);
+const competitionNameFilter = optionalFilter(process.env.CREATE_MAINNET_COMPETITION_NAME);
+const matchOnly = process.env.CREATE_MAINNET_MATCH_ONLY === "true";
+const missingOnly = process.env.CREATE_MAINNET_MISSING_ONLY === "true";
 const databaseUrl = process.env.DIRECT_URL || process.env.DATABASE_URL;
 
 if (!databaseUrl) {
@@ -26,20 +30,26 @@ const client = new Client({
 await client.connect();
 
 try {
-  const candidates = await listCandidates(client, liveGraceHours);
+  const candidates = await listCandidates(client, liveGraceHours, {
+    sport: sportFilter,
+    competitionName: competitionNameFilter,
+    matchOnly,
+    missingOnly
+  });
   const created: unknown[] = [];
   const recovered: unknown[] = [];
   const failed: unknown[] = [];
   let checked = 0;
 
   for (const market of candidates) {
-    if (created.length >= limit) break;
+    if (checked >= limit) break;
     checked += 1;
 
     try {
       const existing = await getMarketOnChain(market.id);
       const result = existing ?? await createMarketOnChain({
         marketId: market.id,
+        questionId: marketQuestionId(market.id),
         marketType: market.type,
         metadataURI: `market:${market.id}`
       });
@@ -82,7 +92,38 @@ try {
   await client.end();
 }
 
-async function listCandidates(client: Client, graceHours: number) {
+async function listCandidates(
+  client: Client,
+  graceHours: number,
+  filters: { sport?: string; competitionName?: string; matchOnly: boolean; missingOnly: boolean }
+) {
+  const params = [String(graceHours)];
+  const optionalWhere: string[] = [];
+
+  if (filters.sport) {
+    params.push(filters.sport);
+    optionalWhere.push(`f.sport = $${params.length}`);
+  }
+  if (filters.competitionName) {
+    params.push(`%${filters.competitionName}%`);
+    optionalWhere.push(`f.competition->>'name' ILIKE $${params.length}`);
+  }
+  if (filters.matchOnly) {
+    optionalWhere.push(`
+      m."fixtureId" IS NOT NULL
+      AND COALESCE(m.template->>'category', '') NOT IN ('PLAYER', 'MAIN_PLAYER', 'PLAYER_FUTURE')
+    `);
+  }
+  if (filters.missingOnly) {
+    optionalWhere.push(`
+      (
+        m."conditionId" IS NULL
+        OR m."tradingStatus" <> 'open'
+        OR m."tradingStatusReason" IS NOT NULL
+      )
+    `);
+  }
+
   const { rows } = await client.query<Candidate>(`
     SELECT
       m.id,
@@ -102,8 +143,9 @@ async function listCandidates(client: Client, graceHours: number) {
           )
         )
       )
+      ${optionalWhere.map((clause) => `AND (${clause})`).join("\n      ")}
     ORDER BY COALESCE(f."kickoffTime", '9999-12-31'::timestamp), m.id
-  `, [String(graceHours)]);
+  `, params);
 
   return rows;
 }
@@ -133,4 +175,9 @@ async function cancelOpenOrders(client: Client) {
 function positiveInt(value: string | undefined, fallback: number) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function optionalFilter(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
 }

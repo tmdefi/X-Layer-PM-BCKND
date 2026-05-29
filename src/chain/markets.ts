@@ -45,7 +45,7 @@ export async function createMarketOnChain(
   const marketFactory = requireAddress(env.MARKET_FACTORY_ADDRESS, "MARKET_FACTORY_ADDRESS");
   const resolver = requireAddress(env.BINARY_MARKET_RESOLVER_ADDRESS, "BINARY_MARKET_RESOLVER_ADDRESS");
   const marketId = hashIdentifier(input.marketId);
-  const questionId = input.questionId ?? hashIdentifier(input.marketId);
+  const questionId = input.questionId ?? marketQuestionId(input.marketId);
 
   const hash = await writeContractWithNonceRetry(clients, {
     address: marketFactory,
@@ -144,6 +144,11 @@ export function outcomeSideToResolverOutcome(outcome: string): ResolverOutcome {
 
 export function hashIdentifier(value: string): Hex {
   return keccak256(stringToHex(value));
+}
+
+export function marketQuestionId(marketId: string): Hex {
+  const salt = env.MARKET_QUESTION_ID_SALT.trim();
+  return hashIdentifier(salt ? `${marketId}:${salt}` : marketId);
 }
 
 export async function getOperatorTransactionReceipt(hash: Hex) {

@@ -1,5 +1,5 @@
 import { env } from "../config/env.js";
-import { hashIdentifier, outcomeSideToResolverOutcome, resolveMarketOnChain } from "../chain/index.js";
+import { getMarketOnChain, hashIdentifier, outcomeSideToResolverOutcome, resolveMarketOnChain } from "../chain/index.js";
 import {
   computeEarlyResolutionDecision,
   computeResolutionDecision,
@@ -365,7 +365,7 @@ export class SettlementWorker {
     summary.computedResolutions += 1;
 
     if (this.submitOnChain && decision.outcome !== "VOID") {
-      const questionId = hashIdentifier(market.id);
+      const questionId = (await getMarketOnChain(market.id))?.questionId ?? hashIdentifier(market.id);
       await runTrackedOperatorTransaction(this.options.store, {
         action: "SUBMIT_RESOLUTION",
         entityId: market.id,

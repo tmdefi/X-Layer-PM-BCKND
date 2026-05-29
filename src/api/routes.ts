@@ -899,7 +899,7 @@ export async function registerRoutes(
       return reply.code(409).send({ error: "Resolution must be reviewed before submission" });
     }
 
-    const questionId = (input.questionId ?? hashIdentifier(market.id)) as Hex;
+    const questionId = (input.questionId ?? (await getMarketOnChain(market.id))?.questionId ?? hashIdentifier(market.id)) as Hex;
     const result = await submitResolutionOperatorTransaction(store, {
       marketId: market.id,
       outcome: decision.outcome,
