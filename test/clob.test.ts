@@ -1179,6 +1179,48 @@ test("market summary list and card feed batch frontend snippets", async () => {
   await app.close();
 });
 
+test("market discovery hides stale live esports fixtures", async () => {
+  const store = new InMemoryStore();
+  const now = Date.now();
+  const staleKickoff = new Date(now - 5 * 60 * 60 * 1000).toISOString();
+  const currentKickoff = new Date(now - 30 * 60 * 1000).toISOString();
+  const staleFixture = esportsFixture("stale-esports", staleKickoff, "live");
+  const currentFixture = esportsFixture("current-esports", currentKickoff, "live");
+  store.upsertFixture(staleFixture);
+  store.upsertFixture(currentFixture);
+  store.upsertMarket({
+    ...createYesNoMarket({
+      id: "stale-esports-market",
+      fixtureId: staleFixture.id,
+      title: "Stale esports team to win",
+      status: "open"
+    }),
+    conditionId: `0x${"1".repeat(64)}`
+  });
+  store.upsertMarket({
+    ...createYesNoMarket({
+      id: "current-esports-market",
+      fixtureId: currentFixture.id,
+      title: "Current esports team to win",
+      status: "open"
+    }),
+    conditionId: `0x${"2".repeat(64)}`
+  });
+
+  const app = await testApp(store);
+  const response = await app.inject({
+    method: "GET",
+    url: "/markets/cards?sport=esports&status=open&tradingStatus=open&sort=kickoff_time"
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.json().cards.map((card: { fixture: { id: string } }) => card.fixture.id), [
+    currentFixture.id
+  ]);
+  assert.equal(response.json().pagination.total, 1);
+  await app.close();
+});
+
 test("player future markets are discoverable and resolve from tournament aggregate stats", async () => {
   const store = new InMemoryStore();
   const market = createPlayerTournamentFutureMarket({
@@ -1297,6 +1339,19 @@ function footballFixture(id: string, kickoffTime: string) {
     awayCompetitor: `${id} Away`,
     kickoffTime,
     status: "scheduled" as const
+  };
+}
+
+function esportsFixture(id: string, kickoffTime: string, status: "scheduled" | "live" = "scheduled") {
+  return {
+    id: `pandascore:${id}`,
+    sport: "esports" as const,
+    source: { provider: "pandascore", externalFixtureId: id },
+    competition: { kind: "tournament" as const, id: "esports-test", name: "Esports Test" },
+    homeCompetitor: `${id} Home`,
+    awayCompetitor: `${id} Away`,
+    kickoffTime,
+    status
   };
 }
 

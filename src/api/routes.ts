@@ -2267,6 +2267,7 @@ function filteredMarkets(
 
 const STALE_SCHEDULED_FIXTURE_GRACE_MS = 2 * 60 * 60 * 1000;
 const STALE_LIVE_FIXTURE_GRACE_MS = 24 * 60 * 60 * 1000;
+const STALE_ESPORTS_LIVE_FIXTURE_GRACE_MS = 4 * 60 * 60 * 1000;
 
 function isCurrentOpenFixtureMarket(store: InMemoryStore, market: MarketDefinition, now: number): boolean {
   if (!market.fixtureId || market.template?.category === "PLAYER_FUTURE") return true;
@@ -2275,7 +2276,12 @@ function isCurrentOpenFixtureMarket(store: InMemoryStore, market: MarketDefiniti
   const kickoffTime = Date.parse(fixture.kickoffTime);
   if (!Number.isFinite(kickoffTime)) return false;
   if (fixture.status === "scheduled") return kickoffTime >= now - STALE_SCHEDULED_FIXTURE_GRACE_MS;
-  if (fixture.status === "live") return kickoffTime >= now - STALE_LIVE_FIXTURE_GRACE_MS;
+  if (fixture.status === "live") {
+    const grace = fixture.sport === "esports"
+      ? STALE_ESPORTS_LIVE_FIXTURE_GRACE_MS
+      : STALE_LIVE_FIXTURE_GRACE_MS;
+    return kickoffTime >= now - grace;
+  }
   return false;
 }
 
