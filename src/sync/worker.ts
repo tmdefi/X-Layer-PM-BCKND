@@ -355,7 +355,17 @@ export class ProviderSyncWorker {
       if (selected.has(market.id)) continue;
       await sleep(env.SYNC_ON_CHAIN_RPC_DELAY_MS);
       const current = await this.currentCollateralMarketOnChain(market.id);
-      if (!current) selected.set(market.id, { ...market, conditionId: undefined });
+      if (!current) {
+        const syncingMarket = {
+          ...market,
+          conditionId: undefined,
+          tradingStatus: "suspended" as const,
+          tradingStatusReason: "Market syncing on-chain",
+          tradingStatusUpdatedAt: new Date().toISOString()
+        };
+        this.options.store.updateMarket(syncingMarket);
+        selected.set(market.id, syncingMarket);
+      }
     }
 
     return [...selected.values()];

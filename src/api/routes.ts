@@ -1978,6 +1978,7 @@ async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<stri
   const uniqueOpenMarkets = [...new Map(
     markets
       .filter((market) => market.status === "open")
+      .filter((market) => !market.conditionId || market.tradingStatusReason === MARKET_SYNCING_REASON)
       .map((market) => [market.id, market])
   ).values()];
 
