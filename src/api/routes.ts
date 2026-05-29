@@ -1993,6 +1993,7 @@ async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<stri
       if (!summary || typeof summary !== "object" || !("market" in summary)) return summary;
       const market = (summary as { market?: MarketDefinition }).market;
       if (!market || market.status !== "open") return summary;
+      if (!conditionIds.has(market.id)) return summary;
       const currentConditionId = conditionIds.get(market.id);
       if (currentConditionId) {
         return {
