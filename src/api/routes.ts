@@ -774,7 +774,9 @@ export async function registerRoutes(
     const markets = filteredMarkets(store, query);
     const cards = sortedMarketSummaryCards(buildMarketSummaryCards(store, markets), query);
     const page = pageItems(cards, query);
-    const checkedCards = await markCardsMissingCurrentFactoryMarkets(page.items);
+    const checkedCards = query.tradingStatus === "open"
+      ? page.items
+      : await markCardsMissingCurrentFactoryMarkets(page.items);
     return {
       cards: filterCardsByRequestedTradingStatus(checkedCards, query.tradingStatus),
       pagination: page.pagination,
@@ -2033,6 +2035,7 @@ function filterCardsByRequestedTradingStatus<T extends Array<Record<string, unkn
         if (!summary || typeof summary !== "object" || !("market" in summary)) return false;
         const market = (summary as { market?: MarketDefinition }).market;
         if (tradingStatus === "open" && !market?.conditionId) return false;
+        if (tradingStatus === "open" && market?.tradingStatusReason === MARKET_SYNCING_REASON) return false;
         return market?.tradingStatus === tradingStatus;
       });
       return { ...card, summaries };
