@@ -2224,6 +2224,9 @@ function filteredMarkets(
     .filter((market) => !query.fixtureId || market.fixtureId === query.fixtureId)
     .filter((market) => !query.status || market.status === query.status)
     .filter((market) => !query.tradingStatus || market.tradingStatus === query.tradingStatus)
+    .filter((market) =>
+      query.tradingStatus !== "open" || (Boolean(market.conditionId) && market.tradingStatusReason !== MARKET_SYNCING_REASON)
+    )
     .filter((market) => !query.marketType || market.type === query.marketType)
     .filter((market) => !query.category || discoveryCategory(market) === query.category)
     .filter((market) => {
