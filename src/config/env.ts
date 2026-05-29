@@ -83,7 +83,9 @@ const envSchema = z.object({
   SYNC_POLL_INTERVAL_SECONDS: z.coerce.number().int().min(60).default(300),
   SYNC_CURRENT_FIXTURE_DAYS: z.coerce.number().int().min(1).max(90).default(3),
   SYNC_CREATE_MARKETS_ON_CHAIN: booleanEnvSchema.default(true),
-  SYNC_ON_CHAIN_MARKET_LIMIT: z.coerce.number().int().min(1).max(500).default(50)
+  SYNC_ON_CHAIN_MARKET_LIMIT: z.coerce.number().int().min(1).max(500).default(50),
+  SYNC_ON_CHAIN_RPC_DELAY_MS: z.coerce.number().int().min(0).max(10_000).default(350),
+  MARKET_CARD_RPC_CONCURRENCY: z.coerce.number().int().min(1).max(12).default(3)
 });
 
 export const env = envSchema.parse(process.env);

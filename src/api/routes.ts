@@ -1982,7 +1982,7 @@ async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<stri
   ).values()];
 
   const conditionIds = new Map<string, string | undefined>();
-  await mapWithConcurrency(uniqueOpenMarkets, 12, async (market) => {
+  await mapWithConcurrency(uniqueOpenMarkets, env.MARKET_CARD_RPC_CONCURRENCY, async (market) => {
     conditionIds.set(market.id, await currentFactoryConditionId(market.id));
   });
 

@@ -299,6 +299,7 @@ export class ProviderSyncWorker {
 
     for (const market of onChainCandidates) {
       try {
+        await sleep(env.SYNC_ON_CHAIN_RPC_DELAY_MS);
         const existing = await this.currentCollateralMarketOnChain(market.id);
         const conditionId =
           existing?.conditionId ??
@@ -352,6 +353,7 @@ export class ProviderSyncWorker {
 
     for (const market of openMarkets.filter((item) => item.conditionId).slice(0, scanLimit)) {
       if (selected.has(market.id)) continue;
+      await sleep(env.SYNC_ON_CHAIN_RPC_DELAY_MS);
       const current = await this.currentCollateralMarketOnChain(market.id);
       if (!current) selected.set(market.id, { ...market, conditionId: undefined });
     }
@@ -511,4 +513,9 @@ function emptyRun(errors: string[]): ProviderSyncRunSummary {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
