@@ -1,6 +1,8 @@
+import { gzip } from "node:zlib";
 import cors from "@fastify/cors";
 import rateLimit from "@fastify/rate-limit";
 import Fastify from "fastify";
+import { promisify } from "node:util";
 import { ZodError } from "zod";
 import { env } from "../config/env.js";
 import { createSettlementWorker } from "../settlement/index.js";
@@ -9,6 +11,9 @@ import { createProviderSyncWorker } from "../sync/index.js";
 import { createOperatorTransactionRecoveryWorker } from "../operator-recovery/index.js";
 import { registerRoutes } from "./routes.js";
 import { PrismaBackedStore, createStore } from "./store.js";
+
+const gzipAsync = promisify(gzip);
+const COMPRESSION_MIN_BYTES = 1024;
 
 export async function buildApp() {
   const app = Fastify({
@@ -38,6 +43,24 @@ export async function buildApp() {
 
   await app.register(rateLimit, {
     global: false
+  });
+
+  app.addHook("onSend", async (request, reply, payload) => {
+    if (!request.headers["accept-encoding"]?.includes("gzip")) return payload;
+    if (reply.getHeader("content-encoding")) return payload;
+    if (payload === null || payload === undefined) return payload;
+
+    const contentType = String(reply.getHeader("content-type") ?? "");
+    if (!contentType.includes("application/json")) return payload;
+
+    const body = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload));
+    if (body.length < COMPRESSION_MIN_BYTES) return payload;
+
+    const compressed = await gzipAsync(body);
+    reply.header("content-encoding", "gzip");
+    reply.header("vary", "accept-encoding");
+    reply.removeHeader("content-length");
+    return compressed;
   });
 
   app.setErrorHandler((error, _request, reply) => {
