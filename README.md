@@ -206,7 +206,7 @@ The default API-Football focus is the 2026 World Cup:
 ```env
 SYNC_WORKER_ENABLED=true
 SYNC_CREATE_MARKETS_ON_CHAIN=true
-SYNC_ON_CHAIN_MARKET_LIMIT=50
+SYNC_ON_CHAIN_MARKET_LIMIT=150
 ```
 
 `SYNC_ON_CHAIN_MARKET_LIMIT` caps contract writes per sync run. Markets that remain open without a `conditionId` are picked up by later runs.
