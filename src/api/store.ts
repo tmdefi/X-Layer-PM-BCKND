@@ -46,6 +46,8 @@ export class InMemoryStore {
   readonly clobOrders = new Map<string, StoredClobOrder>();
   readonly clobFills = new Map<string, StoredClobFill>();
   readonly clobTrades = new Map<string, StoredClobTrade>();
+  private readonly clobOrderIdsByMarket = new Map<string, Set<string>>();
+  private readonly clobTradeIdsByMarket = new Map<string, Set<string>>();
 
   upsertFixture(fixture: Fixture): Fixture {
     const current = this.fixtures.get(fixture.id);
@@ -279,7 +281,7 @@ export class InMemoryStore {
 
   upsertClobOrder(order: StoredClobOrder): StoredClobOrder {
     const updated = { ...order, updatedAt: new Date().toISOString() };
-    this.clobOrders.set(updated.id, updated);
+    this.setClobOrder(updated);
     return updated;
   }
 
@@ -292,21 +294,29 @@ export class InMemoryStore {
   }
 
   listClobOrders(marketId?: string): StoredClobOrder[] {
-    return [...this.clobOrders.values()]
-      .filter((order) => !marketId || order.marketId === marketId)
+    const orders = marketId
+      ? [...(this.clobOrderIdsByMarket.get(marketId) ?? [])]
+        .map((id) => this.clobOrders.get(id))
+        .filter((order): order is StoredClobOrder => Boolean(order))
+      : [...this.clobOrders.values()];
+    return orders
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   }
 
   recordClobTrade(trade: StoredClobTrade, fills: StoredClobFill[], orders: StoredClobOrder[]): StoredClobTrade {
-    this.clobTrades.set(trade.id, trade);
+    this.setClobTrade(trade);
     for (const fill of fills) this.clobFills.set(fill.id, fill);
-    for (const order of orders) this.clobOrders.set(order.id, order);
+    for (const order of orders) this.setClobOrder(order);
     return trade;
   }
 
   listClobTrades(marketId?: string): StoredClobTrade[] {
-    return [...this.clobTrades.values()]
-      .filter((trade) => !marketId || trade.marketId === marketId)
+    const trades = marketId
+      ? [...(this.clobTradeIdsByMarket.get(marketId) ?? [])]
+        .map((id) => this.clobTrades.get(id))
+        .filter((trade): trade is StoredClobTrade => Boolean(trade))
+      : [...this.clobTrades.values()];
+    return trades
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   }
 
@@ -323,6 +333,28 @@ export class InMemoryStore {
   }
 
   async waitForPendingWrites(): Promise<void> {}
+
+  protected setClobOrder(order: StoredClobOrder): void {
+    const current = this.clobOrders.get(order.id);
+    if (current?.marketId && current.marketId !== order.marketId) {
+      this.clobOrderIdsByMarket.get(current.marketId)?.delete(order.id);
+    }
+    this.clobOrders.set(order.id, order);
+    const marketOrders = this.clobOrderIdsByMarket.get(order.marketId) ?? new Set<string>();
+    marketOrders.add(order.id);
+    this.clobOrderIdsByMarket.set(order.marketId, marketOrders);
+  }
+
+  protected setClobTrade(trade: StoredClobTrade): void {
+    const current = this.clobTrades.get(trade.id);
+    if (current?.marketId && current.marketId !== trade.marketId) {
+      this.clobTradeIdsByMarket.get(current.marketId)?.delete(trade.id);
+    }
+    this.clobTrades.set(trade.id, trade);
+    const marketTrades = this.clobTradeIdsByMarket.get(trade.marketId) ?? new Set<string>();
+    marketTrades.add(trade.id);
+    this.clobTradeIdsByMarket.set(trade.marketId, marketTrades);
+  }
 
   private publishTradingStatusChange(
     current: MarketDefinition | undefined,
@@ -470,11 +502,11 @@ export class PrismaBackedStore extends InMemoryStore {
     }
 
     for (const order of clobOrders) {
-      this.clobOrders.set(order.id, clobOrderFromPrisma(order));
+      this.setClobOrder(clobOrderFromPrisma(order));
     }
 
     for (const trade of clobTrades) {
-      this.clobTrades.set(trade.id, {
+      this.setClobTrade({
         id: trade.id,
         marketId: trade.marketId,
         takerOrderId: trade.takerOrderId,
