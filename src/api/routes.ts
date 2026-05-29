@@ -1978,7 +1978,7 @@ async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<stri
   const uniqueOpenMarkets = [...new Map(
     markets
       .filter((market) => market.status === "open")
-      .filter((market) => !market.conditionId || market.tradingStatusReason === MARKET_SYNCING_REASON)
+      .filter((market) => market.tradingStatusReason === MARKET_SYNCING_REASON)
       .map((market) => [market.id, market])
   ).values()];
 
@@ -2032,6 +2032,7 @@ function filterCardsByRequestedTradingStatus<T extends Array<Record<string, unkn
       const summaries = card.summaries.filter((summary) => {
         if (!summary || typeof summary !== "object" || !("market" in summary)) return false;
         const market = (summary as { market?: MarketDefinition }).market;
+        if (tradingStatus === "open" && !market?.conditionId) return false;
         return market?.tradingStatus === tradingStatus;
       });
       return { ...card, summaries };
