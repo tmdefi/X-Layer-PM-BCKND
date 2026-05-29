@@ -354,7 +354,16 @@ export class ProviderSyncWorker {
     for (const market of openMarkets.filter((item) => item.conditionId).slice(0, scanLimit)) {
       if (selected.has(market.id)) continue;
       await sleep(env.SYNC_ON_CHAIN_RPC_DELAY_MS);
-      const current = await this.currentCollateralMarketOnChain(market.id);
+      let current: OnChainStoredMarket | undefined;
+      try {
+        current = await this.currentCollateralMarketOnChain(market.id);
+      } catch (error) {
+        this.options.logger?.warn("Skipping current market demotion after transient on-chain validation failure", {
+          marketId: market.id,
+          error: errorMessage(error)
+        });
+        continue;
+      }
       if (!current) {
         const syncingMarket = {
           ...market,
