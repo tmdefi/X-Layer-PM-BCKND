@@ -1,5 +1,12 @@
 import { env } from "../config/env.js";
-import { createMarketOnChain, getMarketOnChain } from "../chain/index.js";
+import {
+  createMarketOnChain,
+  createPublicChainClient,
+  getMarketOnChain,
+  marketUsesCurrentCollateral,
+  requireAddress,
+  type OnChainStoredMarket
+} from "../chain/index.js";
 import { createBasketballFixtureMarkets, createEsportsFixtureMarkets, createFootballFixtureMarkets, createMmaFixtureMarkets } from "../markets/definitions.js";
 import type { BasketballFixture, EsportsFixture, Fixture, FootballFixture, MarketDefinition, MmaFixture, Sport } from "../markets/types.js";
 import type { InMemoryStore } from "../api/store.js";
@@ -172,7 +179,10 @@ export class ProviderSyncWorker {
       await this.options.store.waitForPendingWrites();
       this.options.store.upsertMarkets(markets);
       await this.options.store.waitForPendingWrites();
-      const onChain = await this.createMarketsOnChain(markets);
+      const onChain = await this.createMarketsOnChain([
+        ...markets,
+        ...currentEligiblePlayerFutureMarkets(this.options.store.listMarkets())
+      ]);
 
       const createdMarkets = markets.filter((market) => !existingMarketIds.has(market.id)).length;
       const summaryErrors = [...errors, ...onChain.errors];
@@ -277,7 +287,7 @@ export class ProviderSyncWorker {
       onChainFailedMarkets: 0
     };
     const errors: string[] = [];
-    const candidates = markets.filter((market) => market.status === "open" && !market.conditionId);
+    const candidates = await this.currentOnChainCandidates(markets);
 
     if (!env.SYNC_CREATE_MARKETS_ON_CHAIN) {
       counts.onChainSkippedMarkets = candidates.length;
@@ -289,7 +299,7 @@ export class ProviderSyncWorker {
 
     for (const market of onChainCandidates) {
       try {
-        const existing = await getMarketOnChain(market.id);
+        const existing = await this.currentCollateralMarketOnChain(market.id);
         const conditionId =
           existing?.conditionId ??
           (await runTrackedOperatorTransaction(this.options.store, {
@@ -314,7 +324,10 @@ export class ProviderSyncWorker {
 
         this.options.store.updateMarket({
           ...market,
-          conditionId
+          conditionId,
+          tradingStatus: "open",
+          tradingStatusReason: undefined,
+          tradingStatusUpdatedAt: new Date().toISOString()
         });
 
         if (existing) counts.onChainRecoveredMarkets += 1;
@@ -327,6 +340,37 @@ export class ProviderSyncWorker {
 
     await this.options.store.waitForPendingWrites();
     return { counts, errors };
+  }
+
+  private async currentOnChainCandidates(markets: MarketDefinition[]): Promise<MarketDefinition[]> {
+    const openMarkets = uniqueMarkets(markets)
+      .filter((market) => market.status === "open")
+      .filter((market) => market.tradingStatus !== "closed");
+    const missingCondition = openMarkets.filter((market) => !market.conditionId);
+    const selected = new Map(missingCondition.map((market) => [market.id, market]));
+    const scanLimit = Math.max(env.SYNC_ON_CHAIN_MARKET_LIMIT * 4, env.SYNC_ON_CHAIN_MARKET_LIMIT);
+
+    for (const market of openMarkets.filter((item) => item.conditionId).slice(0, scanLimit)) {
+      if (selected.has(market.id)) continue;
+      const current = await this.currentCollateralMarketOnChain(market.id);
+      if (!current) selected.set(market.id, { ...market, conditionId: undefined });
+    }
+
+    return [...selected.values()];
+  }
+
+  private async currentCollateralMarketOnChain(marketId: string): Promise<OnChainStoredMarket | undefined> {
+    const stored = await getMarketOnChain(marketId);
+    if (!stored || !env.COLLATERAL_TOKEN_ADDRESS || !env.CONDITIONAL_TOKENS_ADDRESS) return stored;
+
+    const usesCurrentCollateral = await marketUsesCurrentCollateral(
+      createPublicChainClient(),
+      requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS"),
+      requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS"),
+      stored
+    );
+
+    return usesCurrentCollateral ? stored : undefined;
   }
 
   private logInfo(message: string, data: unknown): void {
@@ -344,6 +388,19 @@ function createMarketsForFixture(fixture: Fixture): MarketDefinition[] {
   if (fixture.sport === "mma") return createMmaFixtureMarkets(fixture as MmaFixture, { status: "open" });
   if (fixture.sport === "esports") return createEsportsFixtureMarkets(fixture as EsportsFixture, { status: "open" });
   return [];
+}
+
+function currentEligiblePlayerFutureMarkets(markets: MarketDefinition[]): MarketDefinition[] {
+  const currentYear = new Date().getUTCFullYear();
+  return markets
+    .filter((market) => market.status === "open")
+    .filter((market) => market.tradingStatus !== "closed")
+    .filter((market) => market.template?.category === "PLAYER_FUTURE")
+    .filter((market) => {
+      if (market.template?.category !== "PLAYER_FUTURE") return false;
+      const season = Number(market.template.competition.season);
+      return !Number.isFinite(season) || season >= currentYear;
+    });
 }
 
 function preserveTerminalMarketStatus(next: MarketDefinition, current: MarketDefinition | undefined): MarketDefinition {
@@ -408,6 +465,14 @@ function uniqueFixtures(fixtures: Fixture[]): Fixture[] {
   const byId = new Map<string, Fixture>();
   for (const fixture of fixtures) {
     byId.set(fixture.id, fixture);
+  }
+  return [...byId.values()];
+}
+
+function uniqueMarkets(markets: MarketDefinition[]): MarketDefinition[] {
+  const byId = new Map<string, MarketDefinition>();
+  for (const market of markets) {
+    byId.set(market.id, market);
   }
   return [...byId.values()];
 }
