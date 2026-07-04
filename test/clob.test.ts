@@ -33,6 +33,7 @@ import {
 import { SourceRegistry } from "../src/sources/index.js";
 import { ApiFootballSource } from "../src/sources/api-football.js";
 import { ApiMmaSource } from "../src/sources/api-mma.js";
+import { FootballDataSource } from "../src/sources/football-data.js";
 import { createSettlementWorker } from "../src/settlement/index.js";
 import { buildOrderbook } from "../src/trading/orderbook.js";
 import { manualMatchPlan, planComplementaryMatch, recordMatchResult } from "../src/trading/matcher.js";
@@ -396,6 +397,63 @@ test("API-Football player candidate cache reuses team rankings across fixture re
     assert.equal(second.length, 2);
     assert.equal(paths.filter((path) => path.startsWith("/players?")).length, 2);
     assert.equal(store.playerCandidates.size, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("football-data maps top-league matches and results into football fixtures", async () => {
+  const originalFetch = globalThis.fetch;
+  const paths: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const url = new URL(String(input));
+    paths.push(`${url.pathname}?${url.searchParams.toString()}`);
+    assert.equal((init?.headers as Record<string, string>)["X-Auth-Token"], "test-token");
+
+    if (url.pathname === "/v4/competitions/PL/matches") {
+      assert.equal(url.searchParams.get("dateFrom"), "2026-06-01");
+      assert.equal(url.searchParams.get("dateTo"), "2026-07-01");
+      assert.equal(url.searchParams.get("season"), "2026");
+      return jsonBodyResponse({
+        matches: [footballDataMatch()]
+      });
+    }
+
+    if (url.pathname === "/v4/matches/9001") {
+      return jsonBodyResponse(footballDataMatch({ status: "FINISHED" }));
+    }
+
+    throw new Error(`Unexpected football-data test path: ${url.pathname}`);
+  };
+
+  try {
+    const source = new FootballDataSource("test-token", "https://football-data.test/v4");
+    const [fixture] = await source.listFixtures({
+      sport: "football",
+      from: "2026-06-01",
+      to: "2026-07-01",
+      leagueId: "PL",
+      season: "2026"
+    });
+    const result = await source.getFixtureResult("9001");
+
+    assert.ok(fixture);
+    assert.equal(fixture.id, "football-data:9001");
+    assert.equal(fixture.source.provider, "football-data");
+    assert.equal(fixture.competition?.id, "PL");
+    assert.equal(fixture.competition?.name, "Premier League");
+    assert.equal(fixture.competition?.season, "2026");
+    assert.equal(fixture.homeCompetitor, "Arsenal");
+    assert.equal(fixture.awayCompetitor, "Chelsea");
+    assert.equal(fixture.status, "scheduled");
+    assert.equal(fixture.homeLogoUrl, "https://crests.football-data.org/arsenal.svg");
+    assert.deepEqual(result.score, { homeGoals: 2, awayGoals: 1 });
+    assert.deepEqual(result.halfTimeScore, { homeGoals: 1, awayGoals: 0 });
+    assert.equal(result.status, "finished");
+    assert.deepEqual(paths, [
+      "/v4/competitions/PL/matches?dateFrom=2026-06-01&dateTo=2026-07-01&season=2026",
+      "/v4/matches/9001?"
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1437,6 +1495,37 @@ function apiFootballPlayer(teamId: number) {
   };
 }
 
+function footballDataMatch(overrides: { status?: string } = {}) {
+  return {
+    id: 9001,
+    utcDate: "2026-06-11T19:00:00Z",
+    status: overrides.status ?? "TIMED",
+    competition: {
+      id: 2000,
+      name: "Premier League",
+      code: "PL",
+      type: "LEAGUE"
+    },
+    season: {
+      startDate: "2026-06-11"
+    },
+    homeTeam: {
+      id: 1,
+      name: "Arsenal",
+      crest: "https://crests.football-data.org/arsenal.svg"
+    },
+    awayTeam: {
+      id: 2,
+      name: "Chelsea",
+      crest: "https://crests.football-data.org/chelsea.svg"
+    },
+    score: {
+      fullTime: { home: 2, away: 1 },
+      halfTime: { home: 1, away: 0 }
+    }
+  };
+}
+
 function apiMmaFight() {
   return {
     id: 700,
@@ -1453,6 +1542,13 @@ function apiMmaFight() {
 
 function jsonResponse(response: unknown[]) {
   return new Response(JSON.stringify({ response, paging: { current: 1, total: 1 } }), {
+    status: 200,
+    headers: { "content-type": "application/json" }
+  });
+}
+
+function jsonBodyResponse(body: unknown) {
+  return new Response(JSON.stringify(body), {
     status: 200,
     headers: { "content-type": "application/json" }
   });

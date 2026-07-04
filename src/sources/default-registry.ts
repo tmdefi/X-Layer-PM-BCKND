@@ -1,11 +1,18 @@
 import { createApiFootballSource } from "./api-football.js";
 import { createApiMmaSource } from "./api-mma.js";
+import { createFootballDataSource } from "./football-data.js";
 import { createHighlightlySource } from "./highlightly.js";
 import { createPandaScoreSource } from "./pandascore.js";
 import { SourceRegistry } from "./registry.js";
 
 export function createDefaultSourceRegistry(): SourceRegistry {
   const registry = new SourceRegistry();
+  const footballData = createFootballDataSource();
+
+  if (footballData) {
+    registry.register(footballData);
+  }
+
   const apiFootball = createApiFootballSource();
 
   if (apiFootball) {

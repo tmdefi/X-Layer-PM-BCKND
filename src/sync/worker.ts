@@ -121,7 +121,7 @@ export class ProviderSyncWorker {
     this.lastRunStartedAt = new Date().toISOString();
 
     try {
-      const providers = provider ? [provider] : this.options.sourceRegistry.listProviders();
+      const providers = provider ? [provider] : this.syncProviders();
       const summaries: ProviderSyncProviderSummary[] = [];
 
       for (const currentProvider of providers) {
@@ -230,6 +230,15 @@ export class ProviderSyncWorker {
 
       return summary;
     }
+  }
+
+  private syncProviders(): string[] {
+    const providers = this.options.sourceRegistry.listProviders();
+    if (env.FOOTBALL_MATCH_PROVIDER !== "football-data" || !providers.includes("football-data")) {
+      return providers;
+    }
+
+    return providers.filter((provider) => provider !== "api-football");
   }
 
   private async currentFixtures(provider: string): Promise<{ fixtures: Fixture[]; errors: string[] }> {
@@ -440,6 +449,7 @@ function preserveTerminalMarketStatus(next: MarketDefinition, current: MarketDef
 }
 
 function defaultSportForProvider(provider: string): Sport | undefined {
+  if (provider === "football-data") return "football";
   if (provider === "api-football") return "football";
   if (provider === "api-mma") return "mma";
   if (provider === "highlightly") return "basketball";
@@ -448,14 +458,28 @@ function defaultSportForProvider(provider: string): Sport | undefined {
 }
 
 function rangeFixtureProvider(provider: string): boolean {
-  return provider === "api-football" || provider === "api-mma" || provider === "pandascore";
+  return provider === "football-data" || provider === "api-football" || provider === "api-mma" || provider === "pandascore";
 }
 
 function syncDaysForProvider(provider: string, defaultDays: number): number {
+  if (provider === "football-data") return env.FOOTBALL_DATA_SYNC_FIXTURE_DAYS;
   return provider === "api-football" ? env.API_FOOTBALL_SYNC_FIXTURE_DAYS : defaultDays;
 }
 
 function featuredLeagueRefsForProvider(provider: string): { leagueId: string; season?: string | undefined }[] {
+  if (provider === "football-data") {
+    return env.FOOTBALL_DATA_FEATURED_COMPETITIONS.split(",")
+      .map((raw) => raw.trim())
+      .filter(Boolean)
+      .map((raw) => {
+        const [leagueId, season] = raw.split(":");
+        return {
+          leagueId: leagueId?.trim() ?? "",
+          ...(season?.trim() ? { season: season.trim() } : {})
+        };
+      })
+      .filter((ref) => Boolean(ref.leagueId));
+  }
   if (provider !== "api-football") return [];
   return env.API_FOOTBALL_FEATURED_LEAGUE_IDS.split(",")
     .map((raw) => raw.trim())

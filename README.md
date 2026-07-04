@@ -197,11 +197,12 @@ Frontend flow:
 
 Provider sync creates open core markets for featured fixtures. When on-chain sync is enabled, each open market without a `conditionId` is created through `MarketFactory.createBinaryMarket`, which also registers its outcome tokens with the CLOB exchange.
 
-The default API-Football focus is the 2026 World Cup:
+The default football match feed uses football-data.org for top-league fixtures:
 
-- `API_FOOTBALL_FEATURED_LEAGUE_IDS=1:2026` keeps automated football sync on 2026 World Cup fixtures by default.
-- `API_FOOTBALL_SYNC_FIXTURE_DAYS=30` gives football sync enough look-ahead to create upcoming World Cup markets before kickoff week.
-- Add other API-Football league ids only when they should join automated sync and on-chain market creation.
+- `FOOTBALL_MATCH_PROVIDER=football-data` makes provider sync use football-data.org for football fixtures when `FOOTBALL_DATA_TOKEN` is set.
+- `FOOTBALL_DATA_FEATURED_COMPETITIONS=PL:2026,PD:2026,BL1:2026,SA:2026,FL1:2026` keeps automated football sync on Premier League, La Liga, Bundesliga, Serie A, and Ligue 1 fixtures by default.
+- `FOOTBALL_DATA_SYNC_FIXTURE_DAYS=120` gives football sync enough look-ahead to create upcoming top-league markets before kickoff week.
+- API-Football can still be configured for API-Sports player stats and player-market helpers.
 
 ```env
 SYNC_WORKER_ENABLED=true
@@ -259,7 +260,7 @@ SETTLEMENT_NEAR_KICKOFF_FALLBACK_INTERVAL_SECONDS=300
 
 Set `SETTLEMENT_NEAR_KICKOFF_FALLBACK_INTERVAL_SECONDS=0` to rely only on live feed and terminal fixture status for scheduled fixtures.
 
-API-Football main-card player candidate ranking caches team stats by provider league, player-stat season, and team. That keeps repeated fixtures for the same World Cup team from rerunning the `/players` fan-out every time player scorer markets are prepared:
+API-Football main-card player candidate ranking caches team stats by provider league, player-stat season, and team. That keeps repeated fixtures for the same team from rerunning the `/players` fan-out every time player scorer markets are prepared:
 
 ```env
 PLAYER_CANDIDATE_CACHE_SCHEDULED_SECONDS=21600
