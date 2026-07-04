@@ -83,7 +83,7 @@ export async function tickHouseLiquidity(
 }
 
 async function createHouseComplementBuyOrder(takerOrder: StoredClobOrder): Promise<StoredClobOrder> {
-  const account = privateKeyToAccount(housePrivateKey());
+  const account = houseAccount();
   const takerCollateral = BigInt(takerOrder.order.makerAmount);
   const shareAmount = BigInt(takerOrder.order.takerAmount);
   const houseCollateral = shareAmount - takerCollateral;
@@ -132,13 +132,23 @@ async function createHouseComplementBuyOrder(takerOrder: StoredClobOrder): Promi
 }
 
 function housePrivateKey(): Hex {
-  const key = env.HOUSE_LIQUIDITY_PRIVATE_KEY || env.PRIVATE_KEY;
-  if (!key) throw new Error("HOUSE_LIQUIDITY_PRIVATE_KEY or PRIVATE_KEY is required for house liquidity");
+  const key = env.HOUSE_LIQUIDITY_PRIVATE_KEY || env.LIQUIDITY_PROVIDER_PRIVATE_KEY || env.PRIVATE_KEY;
+  if (!key) {
+    throw new Error("HOUSE_LIQUIDITY_PRIVATE_KEY, LIQUIDITY_PROVIDER_PRIVATE_KEY, or PRIVATE_KEY is required for house liquidity");
+  }
   return key as Hex;
 }
 
+function houseAccount() {
+  const account = privateKeyToAccount(housePrivateKey());
+  if (env.LIQUIDITY_PROVIDER_ADDRESS && account.address.toLowerCase() !== env.LIQUIDITY_PROVIDER_ADDRESS.toLowerCase()) {
+    throw new Error("LIQUIDITY_PROVIDER_ADDRESS does not match the configured house liquidity private key");
+  }
+  return account;
+}
+
 function isHouseWallet(address: string): boolean {
-  return privateKeyToAccount(housePrivateKey()).address.toLowerCase() === address.toLowerCase();
+  return houseAccount().address.toLowerCase() === address.toLowerCase();
 }
 
 function maxHouseOrderAmount(): bigint {

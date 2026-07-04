@@ -382,12 +382,12 @@ export class ProviderSyncWorker {
 
   private async currentCollateralMarketOnChain(marketId: string): Promise<OnChainStoredMarket | undefined> {
     const stored = await getMarketOnChain(marketId);
-    if (!stored || !env.COLLATERAL_TOKEN_ADDRESS || !env.CONDITIONAL_TOKENS_ADDRESS) return stored;
+    if (!stored || !env.USDC_TOKEN_ADDRESS || !env.CONDITIONAL_TOKENS_ADDRESS) return stored;
 
     const usesCurrentCollateral = await marketUsesCurrentCollateral(
       createPublicChainClient(),
       requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS"),
-      requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS"),
+      requireAddress(env.USDC_TOKEN_ADDRESS, "USDC_TOKEN_ADDRESS"),
       stored
     );
 

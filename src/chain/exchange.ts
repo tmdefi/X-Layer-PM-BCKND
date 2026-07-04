@@ -92,7 +92,7 @@ export async function prepareExchangeOrder(input: {
     typedData: {
       domain: {
         ...exchangeDomain,
-        chainId: env.XLAYER_CHAIN_ID,
+        chainId: env.ARC_CHAIN_ID,
         verifyingContract: exchange
       },
       types: exchangeOrderTypedData,
@@ -161,7 +161,7 @@ export async function getExchangeOrderReadiness(input: ExchangeOrderReadinessInp
 
   const publicClient = createPublicChainClient();
   const exchange = exchangeAddress();
-  const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+  const collateral = requireAddress(env.USDC_TOKEN_ADDRESS, "USDC_TOKEN_ADDRESS");
   const conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
   await assertMarketUsesCurrentCollateral(publicClient, market, collateral, conditionalTokens);
   const tokenId = input.outcomeSide === "NO" || input.outcomeSide === "UNDER" ? market.token0 : market.token1;
@@ -232,7 +232,7 @@ export async function getAccountPortfolioBalances(
   markets: MarketDefinition[]
 ): Promise<AccountPortfolioBalances> {
   const publicClient = createPublicChainClient();
-  const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+  const collateral = requireAddress(env.USDC_TOKEN_ADDRESS, "USDC_TOKEN_ADDRESS");
   const conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
   const collateralBalance = await publicClient.readContract({
     address: collateral,
@@ -293,7 +293,7 @@ export async function redemptionTransaction(marketId: string) {
   if (!stored) throw new Error(`Market ${marketId} has not been created on-chain`);
 
   const conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS");
-  const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+  const collateral = requireAddress(env.USDC_TOKEN_ADDRESS, "USDC_TOKEN_ADDRESS");
   const publicClient = createPublicChainClient();
   const usesCurrentCollateral = await marketUsesCurrentCollateral(
     publicClient,
@@ -367,7 +367,7 @@ async function assertMarketUsesCurrentCollateral(
     token0: string;
     token1: string;
   },
-  collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS"),
+  collateral = requireAddress(env.USDC_TOKEN_ADDRESS, "USDC_TOKEN_ADDRESS"),
   conditionalTokens = requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS")
 ) {
   const usesCurrentCollateral = await marketUsesCurrentCollateral(
@@ -532,7 +532,7 @@ export function incrementNonceTransaction() {
 }
 
 export function collateralTransferTransaction(to: Address, amount: string) {
-  const collateral = requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+  const collateral = requireAddress(env.USDC_TOKEN_ADDRESS, "USDC_TOKEN_ADDRESS");
   return {
     to: collateral,
     data: encodeFunctionData({

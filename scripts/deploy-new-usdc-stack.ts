@@ -23,17 +23,21 @@ const conditionalTokensArtifact = readLegacyArtifact("ConditionalTokens.json");
 const privateKey = env.PRIVATE_KEY as Hex | undefined;
 if (!privateKey) throw new Error("PRIVATE_KEY is required to deploy the new USDC stack");
 
-const collateral = requireConfiguredAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS");
+const collateral = requireConfiguredAddress(env.USDC_TOKEN_ADDRESS, "USDC_TOKEN_ADDRESS");
 const admin = requireConfiguredAddress(env.ADMIN_ADDRESS, "ADMIN_ADDRESS");
 const account = privateKeyToAccount(privateKey);
 const chain = {
-  id: env.XLAYER_CHAIN_ID,
-  name: env.XLAYER_CHAIN_ID === 196 ? "X Layer" : "X Layer Custom",
-  nativeCurrency: { name: "OKB", symbol: "OKB", decimals: 18 },
-  rpcUrls: { default: { http: [env.XLAYER_RPC_URL] } }
+  id: env.ARC_CHAIN_ID,
+  name: env.ARC_CHAIN_NAME,
+  nativeCurrency: {
+    name: env.ARC_NATIVE_CURRENCY_NAME,
+    symbol: env.ARC_NATIVE_CURRENCY_SYMBOL,
+    decimals: env.ARC_NATIVE_CURRENCY_DECIMALS
+  },
+  rpcUrls: { default: { http: [env.ARC_RPC_URL] } }
 } as const;
-const publicClient = createPublicClient({ chain, transport: http(env.XLAYER_RPC_URL) });
-const walletClient = createWalletClient({ account, chain, transport: http(env.XLAYER_RPC_URL) });
+const publicClient = createPublicClient({ chain, transport: http(env.ARC_RPC_URL) });
+const walletClient = createWalletClient({ account, chain, transport: http(env.ARC_RPC_URL) });
 
 const conditionalTokens = await existingOrDeploy(
   "ConditionalTokens",

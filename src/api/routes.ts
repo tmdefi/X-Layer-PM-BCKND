@@ -21,7 +21,7 @@ import {
   resolveMarketOnChain,
   validateExchangeOrder,
   exchangeDomain,
-  xLayerChain
+  arcTestnetChain
 } from "../chain/index.js";
 import { env } from "../config/env.js";
 import {
@@ -116,6 +116,7 @@ import {
 
 export type ClobRouteChain = {
   getMarketOnChain: typeof getMarketOnChain;
+  marketUsesCurrentCollateral: typeof marketUsesCurrentCollateral;
   getExchangeOrderReadiness: typeof getExchangeOrderReadiness;
   validateExchangeOrder: typeof validateExchangeOrder;
   getAccountPortfolioBalances: typeof getAccountPortfolioBalances;
@@ -125,6 +126,7 @@ export type ClobRouteChain = {
 
 const defaultClobRouteChain: ClobRouteChain = {
   getMarketOnChain,
+  marketUsesCurrentCollateral,
   getExchangeOrderReadiness,
   validateExchangeOrder,
   getAccountPortfolioBalances,
@@ -772,13 +774,14 @@ export async function registerRoutes(
   } }>("/markets/cards", async (request) => {
     const query = marketListQuerySchema.parse(request.query);
     const markets = filteredMarkets(store, query);
-    const cards = sortedMarketSummaryCards(buildMarketSummaryCards(store, markets), query);
-    const page = pageItems(cards, query);
-    const checkedCards = query.tradingStatus === "open"
-      ? page.items
-      : await markCardsMissingCurrentFactoryMarkets(page.items);
+    const cards = await markCardsMissingCurrentFactoryMarkets(
+      sortedMarketSummaryCards(buildMarketSummaryCards(store, markets), query),
+      clobChain
+    );
+    const filteredCards = filterCardsByRequestedTradingStatus(cards, query.tradingStatus);
+    const page = pageItems(filteredCards, query);
     return {
-      cards: filterCardsByRequestedTradingStatus(checkedCards, query.tradingStatus),
+      cards: page.items,
       pagination: page.pagination,
       sort: discoverySort(query)
     };
@@ -1607,23 +1610,25 @@ function operatorTransactionAction(action: string | undefined) {
 }
 
 function walletConnectionConfig() {
-  const chain = xLayerChain();
+  const chain = arcTestnetChain();
   return {
     chain: {
       id: chain.id,
       hexId: hexChainId(chain.id),
       name: chain.name,
       nativeCurrency: chain.nativeCurrency,
-      rpcUrls: chain.rpcUrls.default.http
+      rpcUrls: chain.rpcUrls.default.http,
+      blockExplorerUrls: [chain.blockExplorers.default.url]
     },
     walletAddEthereumChain: {
       chainId: hexChainId(chain.id),
       chainName: chain.name,
       nativeCurrency: chain.nativeCurrency,
-      rpcUrls: chain.rpcUrls.default.http
+      rpcUrls: chain.rpcUrls.default.http,
+      blockExplorerUrls: [chain.blockExplorers.default.url]
     },
     contracts: {
-      collateralToken: env.COLLATERAL_TOKEN_ADDRESS || undefined,
+      collateralToken: env.USDC_TOKEN_ADDRESS || undefined,
       conditionalTokens: env.CONDITIONAL_TOKENS_ADDRESS || undefined,
       ctfExchange: env.CTF_EXCHANGE_ADDRESS || undefined,
       marketFactory: env.MARKET_FACTORY_ADDRESS || undefined,
@@ -1639,9 +1644,9 @@ function walletConnectionConfig() {
     },
     capabilities: {
       signClobOrders: Boolean(env.CTF_EXCHANGE_ADDRESS),
-      buyApprovalTransactions: Boolean(env.COLLATERAL_TOKEN_ADDRESS && env.CTF_EXCHANGE_ADDRESS),
+      buyApprovalTransactions: Boolean(env.USDC_TOKEN_ADDRESS && env.CTF_EXCHANGE_ADDRESS),
       sellApprovalTransactions: Boolean(env.CONDITIONAL_TOKENS_ADDRESS && env.CTF_EXCHANGE_ADDRESS),
-      redemptionTransactions: Boolean(env.COLLATERAL_TOKEN_ADDRESS && env.CONDITIONAL_TOKENS_ADDRESS)
+      redemptionTransactions: Boolean(env.USDC_TOKEN_ADDRESS && env.CONDITIONAL_TOKENS_ADDRESS)
     }
   };
 }
@@ -1967,7 +1972,10 @@ const currentFactoryMarketCache = new Map<string, { checkedAt: number; condition
 const CURRENT_FACTORY_MARKET_CACHE_MS = 5 * 60_000;
 const MARKET_SYNCING_REASON = "Market syncing on-chain";
 
-async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<string, unknown>>>(cards: T): Promise<T> {
+async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<string, unknown>>>(
+  cards: T,
+  clobChain: Pick<ClobRouteChain, "getMarketOnChain" | "marketUsesCurrentCollateral">
+): Promise<T> {
   const markets = cards.flatMap((card) =>
     Array.isArray(card.summaries)
       ? card.summaries
@@ -1980,13 +1988,13 @@ async function markCardsMissingCurrentFactoryMarkets<T extends Array<Record<stri
   const uniqueOpenMarkets = [...new Map(
     markets
       .filter((market) => market.status === "open")
-      .filter((market) => market.tradingStatusReason === MARKET_SYNCING_REASON)
+      .filter((market) => Boolean(market.conditionId) || market.tradingStatusReason === MARKET_SYNCING_REASON)
       .map((market) => [market.id, market])
   ).values()];
 
   const conditionIds = new Map<string, string | undefined>();
   await mapWithConcurrency(uniqueOpenMarkets, env.MARKET_CARD_RPC_CONCURRENCY, async (market) => {
-    conditionIds.set(market.id, await currentFactoryConditionId(market.id));
+    conditionIds.set(market.id, await currentFactoryConditionId(market.id, clobChain));
   });
 
   return cards.map((card) => {
@@ -2043,26 +2051,25 @@ function filterCardsByRequestedTradingStatus<T extends Array<Record<string, unkn
     .filter((card) => !Array.isArray(card.summaries) || card.summaries.length > 0) as T;
 }
 
-async function currentFactoryConditionId(marketId: string): Promise<string | undefined> {
+async function currentFactoryConditionId(
+  marketId: string,
+  clobChain: Pick<ClobRouteChain, "getMarketOnChain" | "marketUsesCurrentCollateral">
+): Promise<string | undefined> {
   const cached = currentFactoryMarketCache.get(marketId);
-  if (cached && Date.now() - cached.checkedAt < CURRENT_FACTORY_MARKET_CACHE_MS) {
+  if (cached?.conditionId && Date.now() - cached.checkedAt < CURRENT_FACTORY_MARKET_CACHE_MS) {
     return cached.conditionId;
   }
 
   try {
-    const stored = await getMarketOnChain(marketId);
-    if (stored && env.COLLATERAL_TOKEN_ADDRESS && env.CONDITIONAL_TOKENS_ADDRESS) {
-      const usesCurrentCollateral = await marketUsesCurrentCollateral(
+    const stored = await clobChain.getMarketOnChain(marketId);
+    if (stored && env.USDC_TOKEN_ADDRESS && env.CONDITIONAL_TOKENS_ADDRESS) {
+      const usesCurrentCollateral = await clobChain.marketUsesCurrentCollateral(
         createPublicChainClient(),
         requireAddress(env.CONDITIONAL_TOKENS_ADDRESS, "CONDITIONAL_TOKENS_ADDRESS"),
-        requireAddress(env.COLLATERAL_TOKEN_ADDRESS, "COLLATERAL_TOKEN_ADDRESS"),
+        requireAddress(env.USDC_TOKEN_ADDRESS, "USDC_TOKEN_ADDRESS"),
         stored
       );
       if (!usesCurrentCollateral) {
-        currentFactoryMarketCache.set(marketId, {
-          checkedAt: Date.now(),
-          conditionId: undefined
-        });
         return undefined;
       }
     }
@@ -2072,10 +2079,6 @@ async function currentFactoryConditionId(marketId: string): Promise<string | und
     });
     return stored?.conditionId;
   } catch {
-    currentFactoryMarketCache.set(marketId, {
-      checkedAt: Date.now(),
-      conditionId: undefined
-    });
     return undefined;
   }
 }

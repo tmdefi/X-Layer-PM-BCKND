@@ -98,7 +98,7 @@ test("SELL readiness checks Conditional Tokens approval payload", () => {
   assert.deepEqual(decoded.args, [exchange, true]);
 });
 
-test("wallet config exposes X Layer connection data without backend secrets", async () => {
+test("wallet config exposes Arc testnet connection data without backend secrets", async () => {
   const app = await testApp(marketStore(), readyClobChain());
   const response = await app.inject({ method: "GET", url: "/wallet/config" });
   const config = response.json();
@@ -145,6 +145,7 @@ test("signed order submission rejects missing balance or approval before signatu
   let validateCalled = false;
   const app = await testApp(store, {
     getMarketOnChain: async () => storedMarket(),
+    marketUsesCurrentCollateral: async () => true,
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => {
       validateCalled = true;
@@ -181,6 +182,7 @@ test("order readiness rejects a lifecycle-open market when trading is closed", a
   });
   const app = await testApp(store, {
     getMarketOnChain: async () => storedMarket(),
+    marketUsesCurrentCollateral: async () => true,
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
     getAccountPortfolioBalances: async () => portfolioBalances(),
@@ -584,6 +586,7 @@ test("fill bookkeeping records trades and partial or full order remaining sizes"
 test("operator and market mutation endpoints are protected", async () => {
   const app = await testApp(marketStore(), {
     getMarketOnChain: async () => storedMarket(),
+    marketUsesCurrentCollateral: async () => true,
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
     getAccountPortfolioBalances: async () => portfolioBalances(),
@@ -921,6 +924,7 @@ test("portfolio summarizes orders, fills, balances, and redeemable submitted pos
 
   const app = await testApp(store, {
     getMarketOnChain: async () => storedMarket(),
+    marketUsesCurrentCollateral: async () => true,
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
     getAccountPortfolioBalances: async () => portfolioBalances(),
@@ -1029,6 +1033,7 @@ test("market data routes expose frontend prices, ticks, summaries, and candles",
 
   const app = await testApp(store, {
     getMarketOnChain: async () => storedMarket(),
+    marketUsesCurrentCollateral: async () => true,
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
     getAccountPortfolioBalances: async () => portfolioBalances(),
@@ -1134,6 +1139,7 @@ test("market summary list and card feed batch frontend snippets", async () => {
 
   const app = await testApp(store, {
     getMarketOnChain: async () => storedMarket(),
+    marketUsesCurrentCollateral: async () => true,
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => `0x${"c".repeat(64)}` as Hex,
     getAccountPortfolioBalances: async () => portfolioBalances(),
@@ -1179,6 +1185,52 @@ test("market summary list and card feed batch frontend snippets", async () => {
   await app.close();
 });
 
+test("market card feed only exposes markets on the current Arc contract", async () => {
+  const store = new InMemoryStore();
+  const fixture = footballFixture("arc-current", new Date(Date.now() + 60 * 60 * 1000).toISOString());
+  store.upsertFixture(fixture);
+  store.upsertMarket({
+    ...createYesNoMarket({
+      id: "old-contract-market",
+      fixtureId: fixture.id,
+      title: "Old contract market",
+      status: "open"
+    }),
+    conditionId: `0x${"1".repeat(64)}`
+  });
+  store.upsertMarket({
+    ...createYesNoMarket({
+      id: "current-contract-market",
+      fixtureId: fixture.id,
+      title: "Current contract market",
+      status: "open"
+    }),
+    conditionId: `0x${"2".repeat(64)}`
+  });
+
+  const app = await testApp(store, {
+    ...readyClobChain(),
+    getMarketOnChain: async (marketId) => marketId === "current-contract-market"
+      ? { ...storedMarket(), conditionId: `0x${"2".repeat(64)}` as Hex }
+      : undefined
+  });
+  const response = await app.inject({
+    method: "GET",
+    url: "/markets/cards?status=open&tradingStatus=open&sort=kickoff_time"
+  });
+  const body = response.json();
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.pagination.total, 1);
+  assert.deepEqual(
+    body.cards.flatMap((card: { summaries: Array<{ market: { id: string } }> }) =>
+      card.summaries.map((summary) => summary.market.id)
+    ),
+    ["current-contract-market"]
+  );
+  await app.close();
+});
+
 test("market discovery hides stale live esports fixtures", async () => {
   const store = new InMemoryStore();
   const now = Date.now();
@@ -1207,7 +1259,7 @@ test("market discovery hides stale live esports fixtures", async () => {
     conditionId: `0x${"2".repeat(64)}`
   });
 
-  const app = await testApp(store);
+  const app = await testApp(store, readyClobChain());
   const response = await app.inject({
     method: "GET",
     url: "/markets/cards?sport=esports&status=open&tradingStatus=open&sort=kickoff_time"
@@ -1306,6 +1358,7 @@ async function testApp(store: InMemoryStore, clobChain: ClobRouteChain) {
 function readyClobChain(): ClobRouteChain {
   return {
     getMarketOnChain: async () => storedMarket(),
+    marketUsesCurrentCollateral: async () => true,
     getExchangeOrderReadiness: async () => unreadyBuyReadiness(),
     validateExchangeOrder: async () => transactionHash,
     getAccountPortfolioBalances: async () => portfolioBalances(),

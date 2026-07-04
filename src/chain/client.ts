@@ -14,14 +14,14 @@ export function createChainClients() {
   return {
     account,
     publicClient: createPublicChainClient(),
-    walletClient: createWalletClient({ account, chain: xLayerChain(), transport: http(env.XLAYER_RPC_URL) })
+    walletClient: createWalletClient({ account, chain: arcTestnetChain(), transport: http(env.ARC_RPC_URL) })
   };
 }
 
 export function createPublicChainClient() {
   return createPublicClient({
-    chain: xLayerChain(),
-    transport: http(env.XLAYER_RPC_URL)
+    chain: arcTestnetChain(),
+    transport: http(env.ARC_RPC_URL)
   });
 }
 
@@ -33,18 +33,24 @@ export function requireAddress(value: string | undefined, name: string): Address
   return value as Address;
 }
 
-export function xLayerChain() {
+export function arcTestnetChain() {
   return {
-    id: env.XLAYER_CHAIN_ID,
-    name: env.XLAYER_CHAIN_ID === 196 ? "X Layer" : "X Layer Custom",
+    id: env.ARC_CHAIN_ID,
+    name: env.ARC_CHAIN_NAME,
     nativeCurrency: {
-      name: "OKB",
-      symbol: "OKB",
-      decimals: 18
+      name: env.ARC_NATIVE_CURRENCY_NAME,
+      symbol: env.ARC_NATIVE_CURRENCY_SYMBOL,
+      decimals: env.ARC_NATIVE_CURRENCY_DECIMALS
     },
     rpcUrls: {
       default: {
-        http: [env.XLAYER_RPC_URL]
+        http: [env.ARC_RPC_URL]
+      }
+    },
+    blockExplorers: {
+      default: {
+        name: "Arcscan",
+        url: env.ARC_EXPLORER_URL
       }
     }
   } as const;

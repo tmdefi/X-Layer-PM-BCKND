@@ -1,6 +1,6 @@
 # Prediction Market Backend
 
-Backend starter for binary prediction markets on X Layer.
+Backend starter for binary prediction markets on Arc testnet.
 
 The first module is `src/markets`, which defines canonical market types:
 
@@ -141,7 +141,7 @@ Recommended Railway setup:
 2. Add Railway Postgres and set `DATABASE_ENABLED=true`.
 3. Set `DATABASE_URL` from the Railway Postgres connection string. Set `DIRECT_URL` too if you want to run Prisma migrations from Railway.
 4. Run `npm run prisma:deploy` once after Postgres is attached and the database env vars are present.
-5. Add the X Layer, contract, provider API, and operator env vars from `.env.example`.
+5. Add the Arc testnet, contract, provider API, and operator env vars from `.env.example`.
 
 For production behavior, use `HOST=0.0.0.0`, keep `PORT` unset so Railway can inject it, and only enable `SETTLEMENT_SUBMIT_ON_CHAIN=true` when the backend wallet is funded and intended to submit resolver transactions.
 
@@ -184,7 +184,7 @@ The frontend can bootstrap wallet connection from the public backend config rout
 GET /wallet/config
 ```
 
-It returns the X Layer chain id in decimal and wallet hex form, public RPC data, the `wallet_addEthereumChain` payload, configured market contract addresses, the CLOB order-signing domain, and capability flags for approvals and redemption payloads. Backend keys and operator API credentials are never returned.
+It returns the Arc testnet chain id in decimal and wallet hex form, public RPC data, the `wallet_addEthereumChain` payload, configured market contract addresses, the CLOB order-signing domain, and capability flags for approvals and redemption payloads. Backend keys and operator API credentials are never returned.
 
 Frontend flow:
 

@@ -100,7 +100,7 @@ export async function signPrivyTypedData(walletId: string, typedData: unknown): 
 export async function sendPrivyTransaction(walletId: string, tx: { to: Address; data: Hex; value?: Hex | undefined }) {
   const response = await requirePrivyClient().wallets().ethereum().sendTransaction(walletId, {
     authorization_context: authorizationContext(),
-    caip2: `eip155:${env.XLAYER_CHAIN_ID}`,
+    caip2: `eip155:${env.ARC_CHAIN_ID}`,
     params: {
       transaction: {
         to: tx.to,
