@@ -772,6 +772,15 @@ export async function registerRoutes(
     offset?: string | undefined;
     limit?: string | undefined;
   } }>("/markets/cards", async (request) => {
+    if (request.query.category === "player_future") {
+      const query = marketListQuerySchema.parse({ ...request.query, category: undefined });
+      const page = pageItems([], query);
+      return {
+        cards: page.items,
+        pagination: page.pagination,
+        sort: discoverySort(query)
+      };
+    }
     const query = marketListQuerySchema.parse(request.query);
     const markets = filteredMarkets(store, query);
     const cards = await markCardsMissingCurrentFactoryMarkets(
@@ -1943,21 +1952,6 @@ function buildMarketSummaryCards(store: InMemoryStore, markets: MarketDefinition
     ];
   });
   const fixtureCardIds = new Set(fixtureMarkets.map((market) => market.id));
-  const playerFutureCards = markets
-    .filter((market) => market.template?.category === "PLAYER_FUTURE")
-    .map((market) => ({
-      type: "PLAYER_FUTURE",
-      playerName: market.template?.category === "PLAYER_FUTURE"
-        ? market.template.player.playerName
-        : undefined,
-      player: market.template?.category === "PLAYER_FUTURE"
-        ? market.template.player
-        : undefined,
-      competition: market.template?.category === "PLAYER_FUTURE"
-        ? market.template.competition
-        : undefined,
-      summaries: [buildMarketSummary(store, market)]
-    }));
   const standaloneCards = markets
     .filter((market) => !fixtureCardIds.has(market.id) && market.template?.category !== "PLAYER_FUTURE")
     .map((market) => ({
@@ -1965,7 +1959,7 @@ function buildMarketSummaryCards(store: InMemoryStore, markets: MarketDefinition
       summaries: [buildMarketSummary(store, market)]
     }));
 
-  return [...fixtureCards, ...playerFutureCards, ...standaloneCards];
+  return [...fixtureCards, ...standaloneCards];
 }
 
 const currentFactoryMarketCache = new Map<string, { checkedAt: number; conditionId?: string | undefined }>();
@@ -2217,7 +2211,7 @@ function filteredMarkets(
     provider?: string | undefined;
     fixtureStatus?: FixtureStatus | undefined;
     marketType?: MarketDefinition["type"] | undefined;
-    category?: "match" | "player" | "main_player" | "player_future" | "standalone" | undefined;
+    category?: "match" | "player" | "main_player" | "standalone" | undefined;
     competitionId?: string | undefined;
     competitionName?: string | undefined;
   }
@@ -2458,7 +2452,6 @@ function discoveryProvider(store: InMemoryStore, market: MarketDefinition): stri
 function discoveryCategory(market: MarketDefinition) {
   if (market.template?.category === "PLAYER") return "player";
   if (market.template?.category === "MAIN_PLAYER") return "main_player";
-  if (market.template?.category === "PLAYER_FUTURE") return "player_future";
   if (!market.fixtureId) return "standalone";
   return "match";
 }

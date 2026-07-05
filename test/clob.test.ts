@@ -1331,14 +1331,14 @@ test("market discovery hides stale live esports fixtures", async () => {
   await app.close();
 });
 
-test("player future markets are discoverable and resolve from tournament aggregate stats", async () => {
+test("player future markets resolve from tournament aggregate stats but are hidden from cards", async () => {
   const store = new InMemoryStore();
   const market = createPlayerTournamentFutureMarket({
     provider: "api-football",
     competition: {
       kind: "league",
       id: "1",
-      name: "World Cup",
+      name: "Premier League",
       season: "2026"
     },
     playerId: "278",
@@ -1356,7 +1356,7 @@ test("player future markets are discoverable and resolve from tournament aggrega
       provider: "api-football",
       externalFixtureId: "1"
     },
-    fixtureId: "world-cup-2026",
+    fixtureId: "premier-league-2026",
     status: "finished",
     tournamentPlayerStats: [{
       provider: "api-football",
@@ -1372,12 +1372,12 @@ test("player future markets are discoverable and resolve from tournament aggrega
   assert.match(decision.reason, /5 goals vs line 4.5/);
 
   const app = await testApp(store, readyClobChain());
-  const cards = await app.inject({ method: "GET", url: "/markets/cards?category=player_future&competitionName=World%20Cup" });
+  const cards = await app.inject({ method: "GET", url: "/markets/cards?competitionName=Premier%20League" });
   assert.equal(cards.statusCode, 200);
-  assert.equal(cards.json().cards.length, 1);
-  assert.equal(cards.json().cards[0].type, "PLAYER_FUTURE");
-  assert.equal(cards.json().cards[0].player.playerName, "Kylian Mbappe");
-  assert.equal(cards.json().cards[0].competition.name, "World Cup");
+  assert.equal(cards.json().cards.length, 0);
+  const playerFutureCategory = await app.inject({ method: "GET", url: "/markets/cards?category=player_future" });
+  assert.equal(playerFutureCategory.statusCode, 200);
+  assert.equal(playerFutureCategory.json().cards.length, 0);
   await app.close();
 });
 
@@ -1387,7 +1387,7 @@ test("player future over lines are constrained to 3.5 through 5.5", () => {
     competition: {
       kind: "league" as const,
       id: "1",
-      name: "World Cup",
+      name: "Premier League",
       season: "2026"
     },
     playerId: "278",
@@ -1474,7 +1474,7 @@ function apiFootballFixture() {
       timestamp: Math.floor(Date.parse("2026-06-11T19:00:00.000Z") / 1000),
       status: { short: "NS" }
     },
-    league: { id: 1, name: "World Cup", season: 2026 },
+    league: { id: 39, name: "Premier League", season: 2026 },
     teams: {
       home: { id: 10, name: "Home" },
       away: { id: 11, name: "Away" }

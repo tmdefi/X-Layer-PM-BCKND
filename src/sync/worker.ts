@@ -179,10 +179,7 @@ export class ProviderSyncWorker {
       await this.options.store.waitForPendingWrites();
       this.options.store.upsertMarkets(markets);
       await this.options.store.waitForPendingWrites();
-      const onChain = await this.createMarketsOnChain([
-        ...markets,
-        ...currentEligiblePlayerFutureMarkets(this.options.store.listMarkets())
-      ]);
+      const onChain = await this.createMarketsOnChain(markets);
 
       const createdMarkets = markets.filter((market) => !existingMarketIds.has(market.id)).length;
       const summaryErrors = [...errors, ...onChain.errors];
@@ -418,19 +415,6 @@ function createMarketsForFixture(fixture: Fixture): MarketDefinition[] {
   if (fixture.sport === "mma") return createMmaFixtureMarkets(fixture as MmaFixture, { status: "open" });
   if (fixture.sport === "esports") return createEsportsFixtureMarkets(fixture as EsportsFixture, { status: "open" });
   return [];
-}
-
-function currentEligiblePlayerFutureMarkets(markets: MarketDefinition[]): MarketDefinition[] {
-  const currentYear = new Date().getUTCFullYear();
-  return markets
-    .filter((market) => market.status === "open")
-    .filter((market) => market.tradingStatus !== "closed")
-    .filter((market) => market.template?.category === "PLAYER_FUTURE")
-    .filter((market) => {
-      if (market.template?.category !== "PLAYER_FUTURE") return false;
-      const season = Number(market.template.competition.season);
-      return !Number.isFinite(season) || season >= currentYear;
-    });
 }
 
 function preserveTerminalMarketStatus(next: MarketDefinition, current: MarketDefinition | undefined): MarketDefinition {

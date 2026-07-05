@@ -322,7 +322,7 @@ export const marketListQuerySchema = z.object({
   provider: z.string().trim().min(1).max(80).optional(),
   fixtureStatus: fixtureStatusSchema.optional(),
   marketType: marketTypeSchema.optional(),
-  category: z.enum(["match", "player", "main_player", "player_future", "standalone"]).optional(),
+  category: z.enum(["match", "player", "main_player", "standalone"]).optional(),
   competitionId: z.string().trim().min(1).max(120).optional(),
   competitionName: z.string().trim().min(1).max(160).optional(),
   sort: z.enum(["kickoff_time", "live_status", "volume", "newest_activity"]).default("kickoff_time"),
