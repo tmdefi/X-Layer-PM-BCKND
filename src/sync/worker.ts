@@ -7,8 +7,8 @@ import {
   requireAddress,
   type OnChainStoredMarket
 } from "../chain/index.js";
-import { createBasketballFixtureMarkets, createEsportsFixtureMarkets, createFootballFixtureMarkets, createMmaFixtureMarkets } from "../markets/definitions.js";
-import type { BasketballFixture, EsportsFixture, Fixture, FootballFixture, MarketDefinition, MmaFixture, Sport } from "../markets/types.js";
+import { createBasketballFixtureMarkets, createCricketFixtureMarkets, createEsportsFixtureMarkets, createFootballFixtureMarkets, createMmaFixtureMarkets } from "../markets/definitions.js";
+import type { BasketballFixture, CricketFixture, EsportsFixture, Fixture, FootballFixture, MarketDefinition, MmaFixture, Sport } from "../markets/types.js";
 import type { InMemoryStore } from "../api/store.js";
 import { runTrackedOperatorTransaction } from "../api/operator-transactions.js";
 import type { FixtureQuery, SourceRegistry } from "../sources/index.js";
@@ -235,7 +235,11 @@ export class ProviderSyncWorker {
       return providers;
     }
 
-    return providers.filter((provider) => provider !== "api-football");
+    if (!providers.includes("api-football") || apiFootballLeagueRefsForSync().length === 0) {
+      return providers.filter((provider) => provider !== "api-football");
+    }
+
+    return providers;
   }
 
   private async currentFixtures(provider: string): Promise<{ fixtures: Fixture[]; errors: string[] }> {
@@ -412,6 +416,7 @@ export function createProviderSyncWorker(options: ProviderSyncWorkerOptions): Pr
 function createMarketsForFixture(fixture: Fixture): MarketDefinition[] {
   if (fixture.sport === "football") return createFootballFixtureMarkets(fixture as FootballFixture, { status: "open" });
   if (fixture.sport === "basketball") return createBasketballFixtureMarkets(fixture as BasketballFixture, { status: "open" });
+  if (fixture.sport === "cricket") return createCricketFixtureMarkets(fixture as CricketFixture, { status: "open" });
   if (fixture.sport === "mma") return createMmaFixtureMarkets(fixture as MmaFixture, { status: "open" });
   if (fixture.sport === "esports") return createEsportsFixtureMarkets(fixture as EsportsFixture, { status: "open" });
   return [];
@@ -438,34 +443,38 @@ function defaultSportForProvider(provider: string): Sport | undefined {
   if (provider === "api-mma") return "mma";
   if (provider === "highlightly") return "basketball";
   if (provider === "pandascore") return "esports";
+  if (provider === "cricket-data") return "cricket";
   return undefined;
 }
 
 function rangeFixtureProvider(provider: string): boolean {
-  return provider === "football-data" || provider === "api-football" || provider === "api-mma" || provider === "pandascore";
+  return provider === "football-data" || provider === "api-football" || provider === "api-mma" || provider === "pandascore" || provider === "cricket-data";
 }
 
 function syncDaysForProvider(provider: string, defaultDays: number): number {
   if (provider === "football-data") return env.FOOTBALL_DATA_SYNC_FIXTURE_DAYS;
+  if (provider === "cricket-data") return env.CRICKET_DATA_SYNC_FIXTURE_DAYS;
   return provider === "api-football" ? env.API_FOOTBALL_SYNC_FIXTURE_DAYS : defaultDays;
 }
 
 function featuredLeagueRefsForProvider(provider: string): { leagueId: string; season?: string | undefined }[] {
   if (provider === "football-data") {
-    return env.FOOTBALL_DATA_FEATURED_COMPETITIONS.split(",")
-      .map((raw) => raw.trim())
-      .filter(Boolean)
-      .map((raw) => {
-        const [leagueId, season] = raw.split(":");
-        return {
-          leagueId: leagueId?.trim() ?? "",
-          ...(season?.trim() ? { season: season.trim() } : {})
-        };
-      })
-      .filter((ref) => Boolean(ref.leagueId));
+    return parseLeagueRefs(env.FOOTBALL_DATA_FEATURED_COMPETITIONS);
   }
   if (provider !== "api-football") return [];
-  return env.API_FOOTBALL_FEATURED_LEAGUE_IDS.split(",")
+  return apiFootballLeagueRefsForSync();
+}
+
+function apiFootballLeagueRefsForSync(): { leagueId: string; season?: string | undefined }[] {
+  return parseLeagueRefs(
+    env.FOOTBALL_MATCH_PROVIDER === "football-data"
+      ? env.API_FOOTBALL_FRIENDLY_LEAGUE_IDS
+      : env.API_FOOTBALL_FEATURED_LEAGUE_IDS
+  );
+}
+
+function parseLeagueRefs(value: string): { leagueId: string; season?: string | undefined }[] {
+  return value.split(",")
     .map((raw) => raw.trim())
     .filter(Boolean)
     .map((raw) => {

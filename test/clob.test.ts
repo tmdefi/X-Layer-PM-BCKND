@@ -18,6 +18,7 @@ import {
 } from "../src/chain/exchange.js";
 import {
   createEsportsFixtureMarkets,
+  createCricketFixtureMarkets,
   createFootballFixtureMarkets,
   createMainCardPlayerMarket,
   createMmaFixtureMarkets,
@@ -34,10 +35,14 @@ import { SourceRegistry } from "../src/sources/index.js";
 import { ApiFootballSource } from "../src/sources/api-football.js";
 import { ApiMmaSource } from "../src/sources/api-mma.js";
 import { FootballDataSource } from "../src/sources/football-data.js";
+import { CricketDataSource } from "../src/sources/cricket-data.js";
+import { createProviderSyncWorker } from "../src/sync/index.js";
 import { createSettlementWorker } from "../src/settlement/index.js";
 import { buildOrderbook } from "../src/trading/orderbook.js";
 import { manualMatchPlan, planComplementaryMatch, recordMatchResult } from "../src/trading/matcher.js";
 import type { ExchangeOrder, StoredClobOrder } from "../src/trading/types.js";
+import type { Fixture, ProviderFixtureResult } from "../src/markets/types.js";
+import type { FixtureQuery, MarketDataSource } from "../src/sources/types.js";
 
 const maker = "0x1111111111111111111111111111111111111111" as Address;
 const makerTwo = "0x2222222222222222222222222222222222222222" as Address;
@@ -456,6 +461,186 @@ test("football-data maps top-league matches and results into football fixtures",
     ]);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("cricket-data maps current matches and winner results into cricket fixtures", async () => {
+  const originalFetch = globalThis.fetch;
+  const paths: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    paths.push(`${url.pathname}?${url.searchParams.toString()}`);
+    assert.equal(url.searchParams.get("apikey"), "test-cricket-key");
+
+    if (url.pathname === "/v1/currentMatches") {
+      assert.equal(url.searchParams.get("offset"), "0");
+      return jsonBodyResponse({
+        data: [cricketDataMatch()],
+        info: { offset: 0, totalRows: 1 }
+      });
+    }
+
+    if (url.pathname === "/v1/match_info") {
+      assert.equal(url.searchParams.get("id"), "cricket-9001");
+      return jsonBodyResponse({
+        data: cricketDataMatch({ status: "India won by 5 wickets", matchStarted: true, matchEnded: true })
+      });
+    }
+
+    throw new Error(`Unexpected cricket-data test path: ${url.pathname}`);
+  };
+
+  try {
+    const source = new CricketDataSource("test-cricket-key", "https://cricket.test/v1");
+    const [fixture] = await source.listFixtures({
+      sport: "cricket",
+      from: "2026-07-01",
+      to: "2026-07-10"
+    });
+    const result = await source.getFixtureResult("cricket-9001");
+
+    assert.ok(fixture);
+    assert.equal(fixture.id, "cricket-data:cricket-9001");
+    assert.equal(fixture.source.provider, "cricket-data");
+    assert.equal(fixture.sport, "cricket");
+    assert.equal(fixture.competition?.id, "series-1");
+    assert.equal(fixture.competition?.name, "India tour of England");
+    assert.equal(fixture.homeCompetitor, "India");
+    assert.equal(fixture.awayCompetitor, "England");
+    assert.equal(fixture.status, "scheduled");
+    assert.equal(fixture.homeLogoUrl, "https://img.test/india.png");
+    assert.deepEqual(result.score, { homeGoals: 1, awayGoals: 0 });
+    assert.equal(result.status, "finished");
+    assert.deepEqual(paths, [
+      "/v1/currentMatches?apikey=test-cricket-key&offset=0",
+      "/v1/match_info?apikey=test-cricket-key&id=cricket-9001"
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("cricket fixture markets create only match winner markets", () => {
+  const fixture = {
+    id: "cricket-data:cricket-9001",
+    sport: "cricket" as const,
+    source: { provider: "cricket-data", externalFixtureId: "cricket-9001" },
+    competition: { kind: "competition" as const, id: "series-1", name: "India tour of England" },
+    homeCompetitor: "India",
+    awayCompetitor: "England",
+    kickoffTime: "2026-07-06T10:00:00.000Z",
+    status: "scheduled" as const
+  };
+  const markets = createCricketFixtureMarkets(fixture, { status: "open" });
+
+  assert.deepEqual(markets.map((market) => market.resolver?.rule), ["HOME_TEAM_WIN", "AWAY_TEAM_WIN"]);
+  assert.deepEqual(markets.map((market) => market.type), ["YES_NO", "YES_NO"]);
+  assert.equal(markets.every((market) => market.status === "open"), true);
+});
+
+test("cricket-data fixture sync is capped for free-tier usage", async () => {
+  const previousLimit = env.CRICKET_DATA_SYNC_FIXTURE_LIMIT;
+  const originalFetch = globalThis.fetch;
+  env.CRICKET_DATA_SYNC_FIXTURE_LIMIT = 10;
+  let requests = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    requests += 1;
+    assert.equal(url.pathname, "/v1/currentMatches");
+    return jsonBodyResponse({
+      data: Array.from({ length: 12 }, (_, index) => cricketDataMatch({
+        id: `cricket-${index + 1}`,
+        dateTimeGMT: `2026-07-${String(index + 1).padStart(2, "0")}T10:00:00Z`
+      })),
+      info: { offset: 0, totalRows: 12 }
+    });
+  };
+
+  try {
+    const source = new CricketDataSource("test-cricket-key", "https://cricket.test/v1");
+    const fixtures = await source.listFixtures({
+      sport: "cricket",
+      from: "2026-07-01",
+      to: "2026-07-31"
+    });
+
+    assert.equal(fixtures.length, 10);
+    assert.equal(fixtures[0]?.id, "cricket-data:cricket-1");
+    assert.equal(fixtures.at(-1)?.id, "cricket-data:cricket-10");
+    assert.equal(requests, 1);
+  } finally {
+    env.CRICKET_DATA_SYNC_FIXTURE_LIMIT = previousLimit;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("provider sync creates cricket markets from CricketData fixtures", async () => {
+  const previousSyncCreateOnChain = env.SYNC_CREATE_MARKETS_ON_CHAIN;
+  env.SYNC_CREATE_MARKETS_ON_CHAIN = false;
+  try {
+    const registry = new SourceRegistry();
+    registry.register(new RecordingCricketSource());
+    const store = new InMemoryStore();
+    const worker = createProviderSyncWorker({
+      store,
+      sourceRegistry: registry,
+      days: 2
+    });
+    const summary = await worker.runOnce("cricket-data");
+
+    assert.equal(summary.errors.length, 0);
+    assert.equal(summary.fetchedFixtures, 1);
+    assert.equal(store.listFixtures()[0]?.sport, "cricket");
+    assert.deepEqual(
+      store.listMarkets().map((market) => market.id),
+      ["cricket-data:sync-match:home-team-win", "cricket-data:sync-match:away-team-win"]
+    );
+  } finally {
+    env.SYNC_CREATE_MARKETS_ON_CHAIN = previousSyncCreateOnChain;
+  }
+});
+
+test("football-data sync keeps API-Football friendlies as companion markets", async () => {
+  const previous = {
+    footballProvider: env.FOOTBALL_MATCH_PROVIDER,
+    footballDataCompetitions: env.FOOTBALL_DATA_FEATURED_COMPETITIONS,
+    apiFootballFeatured: env.API_FOOTBALL_FEATURED_LEAGUE_IDS,
+    apiFootballFriendlies: env.API_FOOTBALL_FRIENDLY_LEAGUE_IDS,
+    syncCreateOnChain: env.SYNC_CREATE_MARKETS_ON_CHAIN
+  };
+  env.FOOTBALL_MATCH_PROVIDER = "football-data";
+  env.FOOTBALL_DATA_FEATURED_COMPETITIONS = "PL:2026";
+  env.API_FOOTBALL_FEATURED_LEAGUE_IDS = "39:2026";
+  env.API_FOOTBALL_FRIENDLY_LEAGUE_IDS = "10:2026,667:2026";
+  env.SYNC_CREATE_MARKETS_ON_CHAIN = false;
+
+  try {
+    const registry = new SourceRegistry();
+    const footballData = new RecordingFootballSource("football-data");
+    const apiFootball = new RecordingFootballSource("api-football");
+    registry.register(footballData);
+    registry.register(apiFootball);
+
+    const store = new InMemoryStore();
+    const worker = createProviderSyncWorker({
+      store,
+      sourceRegistry: registry,
+      days: 2
+    });
+    const summary = await worker.runOnce();
+
+    assert.equal(summary.errors.length, 0);
+    assert.deepEqual(footballData.queries.map((query) => `${query.leagueId}:${query.season}`), ["PL:2026"]);
+    assert.deepEqual(apiFootball.queries.map((query) => `${query.leagueId}:${query.season}`), ["10:2026", "667:2026"]);
+    assert.equal(store.listFixtures().filter((fixture) => fixture.competition?.name === "Friendlies").length, 2);
+    assert.ok(store.listMarkets().some((market) => market.fixtureId === "api-football:10:2026"));
+    assert.ok(store.listMarkets().some((market) => market.fixtureId === "api-football:667:2026"));
+  } finally {
+    env.FOOTBALL_MATCH_PROVIDER = previous.footballProvider;
+    env.FOOTBALL_DATA_FEATURED_COMPETITIONS = previous.footballDataCompetitions;
+    env.API_FOOTBALL_FEATURED_LEAGUE_IDS = previous.apiFootballFeatured;
+    env.API_FOOTBALL_FRIENDLY_LEAGUE_IDS = previous.apiFootballFriendlies;
+    env.SYNC_CREATE_MARKETS_ON_CHAIN = previous.syncCreateOnChain;
   }
 });
 
@@ -1453,6 +1638,70 @@ function footballFixture(id: string, kickoffTime: string) {
   };
 }
 
+class RecordingFootballSource implements MarketDataSource {
+  readonly queries: FixtureQuery[] = [];
+
+  constructor(readonly provider: string) {}
+
+  async listFixtures(query: FixtureQuery): Promise<Fixture[]> {
+    this.queries.push(query);
+    if (this.provider !== "api-football") return [];
+    const leagueId = query.leagueId ?? "friendly";
+    const season = query.season ?? "2026";
+    return [{
+      id: `api-football:${leagueId}:${season}`,
+      sport: "football",
+      source: {
+        provider: this.provider,
+        externalFixtureId: `${leagueId}-${season}`
+      },
+      competition: {
+        kind: "league",
+        id: leagueId,
+        name: "Friendlies",
+        season
+      },
+      homeCompetitor: `${leagueId} Home`,
+      awayCompetitor: `${leagueId} Away`,
+      kickoffTime: "2026-07-15T19:00:00.000Z",
+      status: "scheduled"
+    }];
+  }
+
+  async getFixtureResult(): Promise<ProviderFixtureResult> {
+    throw new Error("not implemented");
+  }
+}
+
+class RecordingCricketSource implements MarketDataSource {
+  readonly provider = "cricket-data";
+
+  async listFixtures(query: FixtureQuery): Promise<Fixture[]> {
+    assert.equal(query.sport, "cricket");
+    return [{
+      id: "cricket-data:sync-match",
+      sport: "cricket",
+      source: {
+        provider: this.provider,
+        externalFixtureId: "sync-match"
+      },
+      competition: {
+        kind: "competition",
+        id: "sync-series",
+        name: "Sync Series"
+      },
+      homeCompetitor: "Sync Home",
+      awayCompetitor: "Sync Away",
+      kickoffTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      status: "scheduled"
+    }];
+  }
+
+  async getFixtureResult(): Promise<ProviderFixtureResult> {
+    throw new Error("not implemented");
+  }
+}
+
 function esportsFixture(id: string, kickoffTime: string, status: "scheduled" | "live" = "scheduled") {
   return {
     id: `pandascore:${id}`,
@@ -1523,6 +1772,32 @@ function footballDataMatch(overrides: { status?: string } = {}) {
       fullTime: { home: 2, away: 1 },
       halfTime: { home: 1, away: 0 }
     }
+  };
+}
+
+function cricketDataMatch(overrides: {
+  id?: string;
+  status?: string;
+  dateTimeGMT?: string;
+  matchStarted?: boolean;
+  matchEnded?: boolean;
+} = {}) {
+  return {
+    id: overrides.id ?? "cricket-9001",
+    name: "India vs England",
+    matchType: "odi",
+    status: overrides.status ?? "Match not started",
+    venue: "Test Ground",
+    dateTimeGMT: overrides.dateTimeGMT ?? "2026-07-06T10:00:00Z",
+    teams: ["India", "England"],
+    teamInfo: [
+      { name: "India", shortname: "IND", img: "https://img.test/india.png" },
+      { name: "England", shortname: "ENG", img: "https://img.test/england.png" }
+    ],
+    series_id: "series-1",
+    series: "India tour of England",
+    matchStarted: overrides.matchStarted ?? false,
+    matchEnded: overrides.matchEnded ?? false
   };
 }
 

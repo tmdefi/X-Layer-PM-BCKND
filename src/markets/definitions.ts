@@ -2,6 +2,7 @@ import { BOTH_TEAMS_TO_SCORE_OUTCOMES, TOTAL_GOALS_OUTCOMES, YES_NO_OUTCOMES } f
 import type {
   BothTeamsToScoreMarketDefinition,
   BasketballFixture,
+  CricketFixture,
   DataSourceRef,
   EsportsFixture,
   Fixture,
@@ -165,7 +166,7 @@ export function createBothTeamsToScoreMarket(
 }
 
 export function createHomeTeamWinMarket(
-  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture,
+  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture | CricketFixture,
   status: MarketStatus = "draft"
 ): YesNoMarketDefinition {
   return createYesNoMarket({
@@ -201,7 +202,7 @@ export function createDrawMarket(
 }
 
 export function createAwayTeamWinMarket(
-  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture,
+  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture | CricketFixture,
   status: MarketStatus = "draft"
 ): YesNoMarketDefinition {
   return createYesNoMarket({
@@ -320,6 +321,15 @@ export function createMmaFixtureMarkets(fixture: MmaFixture, options: CreateFixt
 }
 
 export function createEsportsFixtureMarkets(fixture: EsportsFixture, options: CreateFixtureMarketsOptions = {}) {
+  const status = options.status ?? "draft";
+
+  return [
+    createHomeTeamWinMarket(fixture, status),
+    createAwayTeamWinMarket(fixture, status)
+  ];
+}
+
+export function createCricketFixtureMarkets(fixture: CricketFixture, options: CreateFixtureMarketsOptions = {}) {
   const status = options.status ?? "draft";
 
   return [

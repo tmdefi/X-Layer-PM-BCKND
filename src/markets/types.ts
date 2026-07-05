@@ -1,6 +1,6 @@
 export type MarketType = "YES_NO" | "TOTAL_GOALS" | "BOTH_TEAMS_TO_SCORE";
 
-export type Sport = "football" | "basketball" | "american_football" | "esports" | "mma";
+export type Sport = "football" | "basketball" | "american_football" | "esports" | "mma" | "cricket";
 
 export type MarketStatus = "draft" | "open" | "closed" | "resolved" | "cancelled";
 export type MarketTradingStatus = "open" | "suspended" | "closed";
@@ -62,6 +62,12 @@ export type EsportsFixture = Fixture & {
   sport: "esports";
   gameTitle?: string | undefined;
   tournamentName?: string | undefined;
+};
+
+export type CricketFixture = Fixture & {
+  sport: "cricket";
+  matchType?: string | undefined;
+  venue?: string | undefined;
 };
 
 export type Score = {
