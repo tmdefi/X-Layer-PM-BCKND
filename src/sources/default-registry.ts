@@ -5,6 +5,7 @@ import { createFootballDataSource } from "./football-data.js";
 import { createHighlightlySource } from "./highlightly.js";
 import { createPandaScoreSource } from "./pandascore.js";
 import { SourceRegistry } from "./registry.js";
+import { createTheOddsApiSource } from "./the-odds-api.js";
 
 export function createDefaultSourceRegistry(): SourceRegistry {
   const registry = new SourceRegistry();
@@ -17,6 +18,11 @@ export function createDefaultSourceRegistry(): SourceRegistry {
   const cricketData = createCricketDataSource();
   if (cricketData) {
     registry.register(cricketData);
+  }
+
+  const theOddsApi = createTheOddsApiSource();
+  if (theOddsApi) {
+    registry.register(theOddsApi);
   }
 
   const apiFootball = createApiFootballSource();

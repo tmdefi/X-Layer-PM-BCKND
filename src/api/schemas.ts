@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { PLAYER_TOURNAMENT_FUTURE_OVER_LINES } from "../markets/definitions.js";
 
-export const sportSchema = z.enum(["football", "basketball", "american_football", "esports", "mma", "cricket"]);
+export const sportSchema = z.enum(["football", "basketball", "american_football", "esports", "mma", "cricket", "tennis"]);
 
 export const fixtureStatusSchema = z.enum([
   "scheduled",

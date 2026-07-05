@@ -15,6 +15,7 @@ import type {
   PlayerMarketTemplate,
   PlayerTournamentFutureTemplate,
   ResolverConfig,
+  TennisFixture,
   TotalGoalsLine,
   TotalGoalsMarketDefinition,
   YesNoMarketDefinition
@@ -166,7 +167,7 @@ export function createBothTeamsToScoreMarket(
 }
 
 export function createHomeTeamWinMarket(
-  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture | CricketFixture,
+  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture | CricketFixture | TennisFixture,
   status: MarketStatus = "draft"
 ): YesNoMarketDefinition {
   return createYesNoMarket({
@@ -202,7 +203,7 @@ export function createDrawMarket(
 }
 
 export function createAwayTeamWinMarket(
-  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture | CricketFixture,
+  fixture: FootballFixture | BasketballFixture | MmaFixture | EsportsFixture | CricketFixture | TennisFixture,
   status: MarketStatus = "draft"
 ): YesNoMarketDefinition {
   return createYesNoMarket({
@@ -330,6 +331,15 @@ export function createEsportsFixtureMarkets(fixture: EsportsFixture, options: Cr
 }
 
 export function createCricketFixtureMarkets(fixture: CricketFixture, options: CreateFixtureMarketsOptions = {}) {
+  const status = options.status ?? "draft";
+
+  return [
+    createHomeTeamWinMarket(fixture, status),
+    createAwayTeamWinMarket(fixture, status)
+  ];
+}
+
+export function createTennisFixtureMarkets(fixture: TennisFixture, options: CreateFixtureMarketsOptions = {}) {
   const status = options.status ?? "draft";
 
   return [

@@ -56,16 +56,17 @@ export class CricketDataSource implements MarketDataSource {
       return match ? [this.toFixture(match)] : [];
     }
 
-    const matches = await this.currentMatches();
+    const matches = await this.matches("/matches");
     return matches
       .filter((match) => withinDateWindow(matchKickoffTime(match), query.from, query.to))
-      .slice(0, env.CRICKET_DATA_SYNC_FIXTURE_LIMIT)
       .map((match) => this.toFixture(match))
-      .filter((fixture) => fixture.homeCompetitor && fixture.awayCompetitor);
+      .filter((fixture) => knownCompetitor(fixture.homeCompetitor) && knownCompetitor(fixture.awayCompetitor))
+      .sort((a, b) => Date.parse(a.kickoffTime) - Date.parse(b.kickoffTime))
+      .slice(0, env.CRICKET_DATA_SYNC_FIXTURE_LIMIT);
   }
 
   async listLiveFixtures(): Promise<Fixture[]> {
-    const matches = await this.currentMatches();
+    const matches = await this.matches("/currentMatches");
     return matches
       .filter((match) => mapMatchStatus(match) === "live")
       .map((match) => this.toFixture(match));
@@ -97,25 +98,24 @@ export class CricketDataSource implements MarketDataSource {
     return result;
   }
 
-  private async currentMatches(): Promise<CricketDataMatch[]> {
+  private async matches(path: "/currentMatches" | "/matches"): Promise<CricketDataMatch[]> {
     const matches: CricketDataMatch[] = [];
     const seen = new Set<string>();
     let offset = 0;
 
-    for (let page = 0; page < 3; page += 1) {
+    const pageLimit = path === "/matches" ? 1 : 3;
+    for (let page = 0; page < pageLimit; page += 1) {
       const params = new URLSearchParams({ offset: String(offset) });
-      const body = await this.request<CricketDataListResponse>("/currentMatches", params);
+      const body = await this.request<CricketDataListResponse>(path, params);
       const pageMatches = body.data ?? [];
       for (const match of pageMatches) {
         if (!match.id || seen.has(match.id)) continue;
         seen.add(match.id);
         matches.push(match);
-        if (matches.length >= env.CRICKET_DATA_SYNC_FIXTURE_LIMIT) break;
       }
 
       const totalRows = body.info?.totalRows;
       if (
-        matches.length >= env.CRICKET_DATA_SYNC_FIXTURE_LIMIT ||
         typeof totalRows !== "number" ||
         matches.length >= totalRows ||
         pageMatches.length === 0
@@ -202,7 +202,8 @@ function matchTeams(match: CricketDataMatch): { home: string; away: string } {
     return { home: teams[0]!, away: teams[1]! };
   }
 
-  const [home, away] = (match.name ?? "").split(/\s+v(?:s\.?)?\s+/i).map((team) => team.trim());
+  const matchTitle = (match.name ?? "").split(",")[0] ?? "";
+  const [home, away] = matchTitle.split(/\s+v(?:s\.?)?\s+/i).map((team) => team.trim());
   return {
     home: home || "Home Team",
     away: away || "Away Team"
@@ -231,6 +232,11 @@ function withinDateWindow(kickoffTime: string, from: string | undefined, to: str
   }
 
   return true;
+}
+
+function knownCompetitor(name: string): boolean {
+  const normalized = normalize(name);
+  return Boolean(normalized) && !["tbc", "tbd", "to be confirmed", "unknown"].includes(normalized);
 }
 
 function mapMatchStatus(match: CricketDataMatch): FixtureStatus {

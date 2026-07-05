@@ -6,4 +6,5 @@ export * from "./football-data.js";
 export * from "./highlightly.js";
 export * from "./pandascore.js";
 export * from "./registry.js";
+export * from "./the-odds-api.js";
 export * from "./types.js";

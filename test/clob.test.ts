@@ -17,6 +17,7 @@ import {
   type ExchangeOrderReadiness
 } from "../src/chain/exchange.js";
 import {
+  createTennisFixtureMarkets,
   createEsportsFixtureMarkets,
   createCricketFixtureMarkets,
   createFootballFixtureMarkets,
@@ -36,6 +37,7 @@ import { ApiFootballSource } from "../src/sources/api-football.js";
 import { ApiMmaSource } from "../src/sources/api-mma.js";
 import { FootballDataSource } from "../src/sources/football-data.js";
 import { CricketDataSource } from "../src/sources/cricket-data.js";
+import { TheOddsApiSource } from "../src/sources/the-odds-api.js";
 import { createProviderSyncWorker } from "../src/sync/index.js";
 import { createSettlementWorker } from "../src/settlement/index.js";
 import { buildOrderbook } from "../src/trading/orderbook.js";
@@ -472,7 +474,7 @@ test("cricket-data maps current matches and winner results into cricket fixtures
     paths.push(`${url.pathname}?${url.searchParams.toString()}`);
     assert.equal(url.searchParams.get("apikey"), "test-cricket-key");
 
-    if (url.pathname === "/v1/currentMatches") {
+    if (url.pathname === "/v1/matches") {
       assert.equal(url.searchParams.get("offset"), "0");
       return jsonBodyResponse({
         data: [cricketDataMatch()],
@@ -512,7 +514,7 @@ test("cricket-data maps current matches and winner results into cricket fixtures
     assert.deepEqual(result.score, { homeGoals: 1, awayGoals: 0 });
     assert.equal(result.status, "finished");
     assert.deepEqual(paths, [
-      "/v1/currentMatches?apikey=test-cricket-key&offset=0",
+      "/v1/matches?apikey=test-cricket-key&offset=0",
       "/v1/match_info?apikey=test-cricket-key&id=cricket-9001"
     ]);
   } finally {
@@ -546,7 +548,7 @@ test("cricket-data fixture sync is capped for free-tier usage", async () => {
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     requests += 1;
-    assert.equal(url.pathname, "/v1/currentMatches");
+    assert.equal(url.pathname, "/v1/matches");
     return jsonBodyResponse({
       data: Array.from({ length: 12 }, (_, index) => cricketDataMatch({
         id: `cricket-${index + 1}`,
@@ -594,6 +596,102 @@ test("provider sync creates cricket markets from CricketData fixtures", async ()
     assert.deepEqual(
       store.listMarkets().map((market) => market.id),
       ["cricket-data:sync-match:home-team-win", "cricket-data:sync-match:away-team-win"]
+    );
+  } finally {
+    env.SYNC_CREATE_MARKETS_ON_CHAIN = previousSyncCreateOnChain;
+  }
+});
+
+test("the-odds-api maps tennis events and scores into tennis fixtures", async () => {
+  const originalFetch = globalThis.fetch;
+  const paths: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    paths.push(`${url.pathname}?${url.searchParams.toString()}`);
+    assert.equal(url.searchParams.get("apiKey"), "test-odds-key");
+
+    if (url.pathname === "/v4/sports/tennis_atp_wimbledon/events") {
+      assert.equal(url.searchParams.get("commenceTimeFrom"), "2026-07-01T00:00:00Z");
+      assert.equal(url.searchParams.get("commenceTimeTo"), "2026-07-31T23:59:59Z");
+      return jsonBodyResponse([oddsApiTennisEvent()]);
+    }
+
+    if (url.pathname === "/v4/sports/tennis_atp_wimbledon/scores") {
+      assert.equal(url.searchParams.get("daysFrom"), "3");
+      assert.equal(url.searchParams.get("eventIds"), "tennis-event-1");
+      return jsonBodyResponse([oddsApiTennisScore()]);
+    }
+
+    throw new Error(`Unexpected The Odds API test path: ${url.pathname}`);
+  };
+
+  try {
+    const source = new TheOddsApiSource("test-odds-key", "https://odds.test/v4");
+    const [fixture] = await source.listFixtures({
+      sport: "tennis",
+      from: "2026-07-01",
+      to: "2026-07-31",
+      leagueId: "tennis_atp_wimbledon"
+    });
+    const result = await source.getFixtureResult("tennis_atp_wimbledon:tennis-event-1");
+
+    assert.ok(fixture);
+    assert.equal(fixture.id, "the-odds-api:tennis_atp_wimbledon:tennis-event-1");
+    assert.equal(fixture.sport, "tennis");
+    assert.equal(fixture.competition?.id, "tennis_atp_wimbledon");
+    assert.equal(fixture.competition?.name, "ATP Wimbledon");
+    assert.equal(fixture.homeCompetitor, "Carlos Alcaraz");
+    assert.equal(fixture.awayCompetitor, "Jannik Sinner");
+    assert.equal(fixture.status, "scheduled");
+    assert.deepEqual(result.score, { homeGoals: 3, awayGoals: 1 });
+    assert.equal(result.status, "finished");
+    assert.deepEqual(paths, [
+      "/v4/sports/tennis_atp_wimbledon/events?apiKey=test-odds-key&commenceTimeFrom=2026-07-01T00%3A00%3A00Z&commenceTimeTo=2026-07-31T23%3A59%3A59Z",
+      "/v4/sports/tennis_atp_wimbledon/scores?apiKey=test-odds-key&daysFrom=3&eventIds=tennis-event-1"
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("tennis fixture markets create only match winner markets", () => {
+  const fixture = {
+    id: "the-odds-api:tennis_atp_wimbledon:tennis-event-1",
+    sport: "tennis" as const,
+    source: { provider: "the-odds-api", externalFixtureId: "tennis_atp_wimbledon:tennis-event-1" },
+    competition: { kind: "tournament" as const, id: "tennis_atp_wimbledon", name: "ATP Wimbledon" },
+    homeCompetitor: "Carlos Alcaraz",
+    awayCompetitor: "Jannik Sinner",
+    kickoffTime: "2026-07-06T12:00:00.000Z",
+    status: "scheduled" as const
+  };
+  const markets = createTennisFixtureMarkets(fixture, { status: "open" });
+
+  assert.deepEqual(markets.map((market) => market.resolver?.rule), ["HOME_TEAM_WIN", "AWAY_TEAM_WIN"]);
+  assert.deepEqual(markets.map((market) => market.type), ["YES_NO", "YES_NO"]);
+  assert.equal(markets.every((market) => market.status === "open"), true);
+});
+
+test("provider sync creates tennis markets from The Odds API fixtures", async () => {
+  const previousSyncCreateOnChain = env.SYNC_CREATE_MARKETS_ON_CHAIN;
+  env.SYNC_CREATE_MARKETS_ON_CHAIN = false;
+  try {
+    const registry = new SourceRegistry();
+    registry.register(new RecordingTennisSource());
+    const store = new InMemoryStore();
+    const worker = createProviderSyncWorker({
+      store,
+      sourceRegistry: registry,
+      days: 2
+    });
+    const summary = await worker.runOnce("the-odds-api");
+
+    assert.equal(summary.errors.length, 0);
+    assert.equal(summary.fetchedFixtures, 1);
+    assert.equal(store.listFixtures()[0]?.sport, "tennis");
+    assert.deepEqual(
+      store.listMarkets().map((market) => market.id),
+      ["the-odds-api:sync-tennis:home-team-win", "the-odds-api:sync-tennis:away-team-win"]
     );
   } finally {
     env.SYNC_CREATE_MARKETS_ON_CHAIN = previousSyncCreateOnChain;
@@ -1702,6 +1800,35 @@ class RecordingCricketSource implements MarketDataSource {
   }
 }
 
+class RecordingTennisSource implements MarketDataSource {
+  readonly provider = "the-odds-api";
+
+  async listFixtures(query: FixtureQuery): Promise<Fixture[]> {
+    assert.equal(query.sport, "tennis");
+    return [{
+      id: "the-odds-api:sync-tennis",
+      sport: "tennis",
+      source: {
+        provider: this.provider,
+        externalFixtureId: "tennis_atp_wimbledon:sync-tennis"
+      },
+      competition: {
+        kind: "tournament",
+        id: "tennis_atp_wimbledon",
+        name: "ATP Wimbledon"
+      },
+      homeCompetitor: "Sync Player One",
+      awayCompetitor: "Sync Player Two",
+      kickoffTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      status: "scheduled"
+    }];
+  }
+
+  async getFixtureResult(): Promise<ProviderFixtureResult> {
+    throw new Error("not implemented");
+  }
+}
+
 function esportsFixture(id: string, kickoffTime: string, status: "scheduled" | "live" = "scheduled") {
   return {
     id: `pandascore:${id}`,
@@ -1798,6 +1925,29 @@ function cricketDataMatch(overrides: {
     series: "India tour of England",
     matchStarted: overrides.matchStarted ?? false,
     matchEnded: overrides.matchEnded ?? false
+  };
+}
+
+function oddsApiTennisEvent() {
+  return {
+    id: "tennis-event-1",
+    sport_key: "tennis_atp_wimbledon",
+    sport_title: "ATP Wimbledon",
+    commence_time: "2026-07-06T12:00:00Z",
+    home_team: "Carlos Alcaraz",
+    away_team: "Jannik Sinner"
+  };
+}
+
+function oddsApiTennisScore() {
+  return {
+    ...oddsApiTennisEvent(),
+    completed: true,
+    scores: [
+      { name: "Carlos Alcaraz", score: "3" },
+      { name: "Jannik Sinner", score: "1" }
+    ],
+    last_update: "2026-07-06T15:00:00Z"
   };
 }
 

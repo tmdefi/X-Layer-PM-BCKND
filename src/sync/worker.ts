@@ -7,8 +7,8 @@ import {
   requireAddress,
   type OnChainStoredMarket
 } from "../chain/index.js";
-import { createBasketballFixtureMarkets, createCricketFixtureMarkets, createEsportsFixtureMarkets, createFootballFixtureMarkets, createMmaFixtureMarkets } from "../markets/definitions.js";
-import type { BasketballFixture, CricketFixture, EsportsFixture, Fixture, FootballFixture, MarketDefinition, MmaFixture, Sport } from "../markets/types.js";
+import { createBasketballFixtureMarkets, createCricketFixtureMarkets, createEsportsFixtureMarkets, createFootballFixtureMarkets, createMmaFixtureMarkets, createTennisFixtureMarkets } from "../markets/definitions.js";
+import type { BasketballFixture, CricketFixture, EsportsFixture, Fixture, FootballFixture, MarketDefinition, MmaFixture, Sport, TennisFixture } from "../markets/types.js";
 import type { InMemoryStore } from "../api/store.js";
 import { runTrackedOperatorTransaction } from "../api/operator-transactions.js";
 import type { FixtureQuery, SourceRegistry } from "../sources/index.js";
@@ -417,6 +417,7 @@ function createMarketsForFixture(fixture: Fixture): MarketDefinition[] {
   if (fixture.sport === "football") return createFootballFixtureMarkets(fixture as FootballFixture, { status: "open" });
   if (fixture.sport === "basketball") return createBasketballFixtureMarkets(fixture as BasketballFixture, { status: "open" });
   if (fixture.sport === "cricket") return createCricketFixtureMarkets(fixture as CricketFixture, { status: "open" });
+  if (fixture.sport === "tennis") return createTennisFixtureMarkets(fixture as TennisFixture, { status: "open" });
   if (fixture.sport === "mma") return createMmaFixtureMarkets(fixture as MmaFixture, { status: "open" });
   if (fixture.sport === "esports") return createEsportsFixtureMarkets(fixture as EsportsFixture, { status: "open" });
   return [];
@@ -444,16 +445,18 @@ function defaultSportForProvider(provider: string): Sport | undefined {
   if (provider === "highlightly") return "basketball";
   if (provider === "pandascore") return "esports";
   if (provider === "cricket-data") return "cricket";
+  if (provider === "the-odds-api") return "tennis";
   return undefined;
 }
 
 function rangeFixtureProvider(provider: string): boolean {
-  return provider === "football-data" || provider === "api-football" || provider === "api-mma" || provider === "pandascore" || provider === "cricket-data";
+  return provider === "football-data" || provider === "api-football" || provider === "api-mma" || provider === "pandascore" || provider === "cricket-data" || provider === "the-odds-api";
 }
 
 function syncDaysForProvider(provider: string, defaultDays: number): number {
   if (provider === "football-data") return env.FOOTBALL_DATA_SYNC_FIXTURE_DAYS;
   if (provider === "cricket-data") return env.CRICKET_DATA_SYNC_FIXTURE_DAYS;
+  if (provider === "the-odds-api") return env.THE_ODDS_API_TENNIS_SYNC_FIXTURE_DAYS;
   return provider === "api-football" ? env.API_FOOTBALL_SYNC_FIXTURE_DAYS : defaultDays;
 }
 
